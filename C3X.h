@@ -726,6 +726,12 @@ enum audio_diag_kind {
 // How many times each hooked function will log before going quiet. timeSetEvent in particular may be called over and over for one-shot timers.
 #define MAX_AUDIO_DIAG_LOGS 50
 
+// The game sets up its sound timers and loads sound.dll while it's starting, which is long before C3X reads any config file, so at the time those
+// calls happen we don't yet know whether the player asked for diagnostics. Lines produced that early are held in a buffer of this size and then
+// either printed or thrown away once the config has been read. Startup only produces a couple of dozen lines.
+#define AUDIO_DIAG_BUFFER_LINES 64
+#define AUDIO_DIAG_LINE_LEN 256
+
 enum c3x_label {
 	CL_NEVER_COMPLETES = 0,
 	CL_HALTED,
@@ -2341,6 +2347,13 @@ struct injected_state {
 		bool reported_sound_imports; // so we only walk and report sound.dll's import table once
 
 		int log_counts[COUNT_ADK];
+
+		// Set once the config files have been read and we know whether the player wants any of this. Until then diagnostic lines go into the
+		// buffer instead of straight out, since the calls worth seeing all happen before that point.
+		bool config_has_been_read;
+		char buffered_lines[AUDIO_DIAG_BUFFER_LINES][AUDIO_DIAG_LINE_LEN];
+		int buffered_line_count;
+		int dropped_line_count;
 	} audio_diagnostics;
 
 	// These variables track the states of some OpenGL parameters. They're updated whenever methods like OpenGLRenderer::set_color are called.
