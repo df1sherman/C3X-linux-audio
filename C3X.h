@@ -117,10 +117,12 @@ enum retreat_rules {
 	RR_IF_FAST_AND_NOT_SLOWER,
 };
 
-enum line_drawing_override {
-	LDO_NEVER = 0,
-	LDO_WINE,
-	LDO_ALWAYS
+// Setting shared by the options that work around bugs which only appear when the game is run on Wine (including Proton). "Wine" means apply the
+// workaround only if we detect we're running on Wine, which is what these options normally want to be set to.
+enum wine_workaround_mode {
+	WWM_NEVER = 0,
+	WWM_WINE,
+	WWM_ALWAYS
 };
 
 enum minimap_doubling_mode {
@@ -403,7 +405,10 @@ struct c3x_config {
 	bool prefer_less_expensive_defenders;
 	bool show_untradable_techs_on_trade_screen;
 	bool disallow_useless_bombard_vs_airfields;
-	enum line_drawing_override draw_lines_using_gdi_plus;
+	enum wine_workaround_mode draw_lines_using_gdi_plus;
+	enum wine_workaround_mode stop_stuck_sound_effects;
+	int stuck_sound_effect_timeout;
+	bool log_sound_effect_activity;
 	bool compact_luxury_display_on_city_screen;
 	bool compact_strategic_resource_display_on_city_screen;
 	bool warn_when_chosen_building_would_replace_another;
@@ -701,6 +706,44 @@ enum init_state {
 	IS_UNINITED = 0,
 	IS_OK,
 	IS_INIT_FAILED
+};
+
+// All of Civ 3's audio, both music and sound effects, is played through sound.dll, a Firaxis library that's separate from the main executable. The
+// declarations below cover the small part of its interface that the mod needs in order to stop sounds that get stuck looping under Wine. They were
+// worked out by reverse engineering; for the fuller picture see "Sound Test/sound_test.cpp" and "AMB Editor/preview.c". Methods we don't use are
+// left as unnamed padding so that the slot numbers of the ones we do use stay correct.
+
+// The game keeps 63 Sound_Infos (see Sound_Info_Array in Civ3Conquests.h) so it shouldn't ever have more sounds alive than this. If it somehow
+// does, the extras simply aren't watched, which is no worse than the behavior without the watchdog.
+#define MAX_LIVE_SOUNDS 128
+#define MAX_HOOKED_SOUND_VTABLES 8
+#define SOUND_PATH_LEN 120
+
+typedef struct Sound_Core Sound_Core;
+
+typedef struct {
+	void * omitted[7];
+	int (__fastcall * Play) (Sound_Core * this, int edx); // slot 7
+	int (__fastcall * Stop) (Sound_Core * this, int edx); // slot 8
+	void * omitted_2[68];
+} Sound_Core_vtable;
+
+struct Sound_Core {
+	Sound_Core_vtable * vtable;
+	// many more fields omitted
+};
+
+// Second argument of create_sound. Passing SCT_DETECT_FROM_FILE_EXT does not work, the caller has to say which kind of sound it is.
+enum sound_core_type {
+	SCT_DETECT_FROM_FILE_EXT = 0,
+	SCT_WAV,
+	SCT_MIDI,
+	SCT_AIF,
+	SCT_4,
+	SCT_AMB,
+	SCT_6,
+	SCT_7,
+	SCT_8
 };
 
 enum c3x_label {
@@ -2297,6 +2340,39 @@ struct injected_state {
 		int (__stdcall * DeletePen) (void * gp_pen);
 		int (__stdcall * DrawLineI) (void * gp_graphics, void * gp_pen, int x1, int y1, int x2, int y2);
 	} gdi_plus;
+
+	// Tracks the sounds the game is currently playing so that we can stop any that get stuck. Under Wine, some sound effects (unit attack and
+	// ambience sounds especially) keep repeating forever instead of playing once. AMB sounds loop until they're explicitly stopped, so if the
+	// stop never happens, or never takes effect, the sound runs forever. The watchdog notices sounds that have been playing for longer than any
+	// real sound effect lasts and stops them.
+	// sound_watchdog.init_state is valid any time after patch_init_floating_point. The other fields are only valid once it equals IS_OK.
+	struct sound_watchdog {
+		enum init_state init_state;
+
+		// The sound.dll functions we've hooked, so we can call through to them, plus the import table slots we hooked them in.
+		int (__cdecl * create_sound) (Sound_Core ** out_sound_core, char const * file_path, int sound_core_type);
+		int (__cdecl * delete_sound) (Sound_Core * sound_core);
+		void ** p_create_sound;
+		void ** p_delete_sound;
+
+		// Sound cores of the same kind share one vtable, so there are only a handful of them. We record the ones we've already hooked so we
+		// don't hook the same vtable twice.
+		Sound_Core_vtable * hooked_vtables[MAX_HOOKED_SOUND_VTABLES];
+		int hooked_vtable_count;
+
+		// The original Play and Stop methods from the first vtable we hooked. All sound core vtables seen so far point these at the same
+		// implementations, so one copy is enough. Recorded so the hooks can call through.
+		int (__fastcall * Play) (Sound_Core * this, int edx);
+		int (__fastcall * Stop) (Sound_Core * this, int edx);
+
+		// One entry per sound the game has created and not yet deleted. "started_at" is only meaningful while "playing" is set.
+		struct live_sound {
+			Sound_Core * core;
+			LARGE_INTEGER started_at;
+			bool playing;
+			char path[SOUND_PATH_LEN];
+		} live_sounds[MAX_LIVE_SOUNDS];
+	} sound_watchdog;
 
 	// These variables track the states of some OpenGL parameters. They're updated whenever methods like OpenGLRenderer::set_color are called.
 	unsigned int ogl_color;
