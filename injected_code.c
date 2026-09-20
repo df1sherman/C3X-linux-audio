@@ -2413,12 +2413,12 @@ read_retreat_rules (struct string_slice const * s, int * out_val)
 }
 
 bool
-read_wine_workaround_mode (struct string_slice const * s, int * out_val)
+read_line_drawing_override (struct string_slice const * s, int * out_val)
 {
 	struct string_slice trimmed = trim_string_slice (s, 1);
-	if      (slice_matches_str (&trimmed, "never" )) { *out_val = WWM_NEVER;  return true; }
-	else if (slice_matches_str (&trimmed, "wine"  )) { *out_val = WWM_WINE;   return true; }
-	else if (slice_matches_str (&trimmed, "always")) { *out_val = WWM_ALWAYS; return true; }
+	if      (slice_matches_str (&trimmed, "never" )) { *out_val = LDO_NEVER;  return true; }
+	else if (slice_matches_str (&trimmed, "wine"  )) { *out_val = LDO_WINE;   return true; }
+	else if (slice_matches_str (&trimmed, "always")) { *out_val = LDO_ALWAYS; return true; }
 	else
 		return false;
 }
@@ -3260,10 +3260,7 @@ load_config (char const * file_path, int path_is_relative_to_mod_dir)
 					if (! read_pollution_spawn_effect (&value, (int *)&cfg->pollution_spawn_effect))
 						handle_config_error (&p, CPE_BAD_VALUE);
 				} else if (slice_matches_str (&p.key, "draw_lines_using_gdi_plus")) {
-					if (! read_wine_workaround_mode (&value, (int *)&cfg->draw_lines_using_gdi_plus))
-						handle_config_error (&p, CPE_BAD_VALUE);
-				} else if (slice_matches_str (&p.key, "stop_stuck_sound_effects")) {
-					if (! read_wine_workaround_mode (&value, (int *)&cfg->stop_stuck_sound_effects))
+					if (! read_line_drawing_override (&value, (int *)&cfg->draw_lines_using_gdi_plus))
 						handle_config_error (&p, CPE_BAD_VALUE);
 				} else if (slice_matches_str (&p.key, "double_minimap_size")) {
 					if (! read_minimap_doubling_mode (&value, (int *)&cfg->double_minimap_size))
@@ -20122,6 +20119,8 @@ patch_Map_Renderer_load_images (Map_Renderer *this, int edx)
 	}
 }
 
+void set_up_audio_diagnostics (); // defined down with the rest of the audio diagnostics
+
 void
 patch_init_floating_point ()
 {
@@ -20239,7 +20238,7 @@ patch_init_floating_point ()
 		{"prefer_less_expensive_defenders"                        , false, offsetof (struct c3x_config, prefer_less_expensive_defenders)},
 		{"show_untradable_techs_on_trade_screen"                 , false, offsetof (struct c3x_config, show_untradable_techs_on_trade_screen)},
 		{"disallow_useless_bombard_vs_airfields"                 , true , offsetof (struct c3x_config, disallow_useless_bombard_vs_airfields)},
-		{"log_sound_effect_activity"                             , false, offsetof (struct c3x_config, log_sound_effect_activity)},
+		{"log_audio_diagnostics"                                 , false, offsetof (struct c3x_config, log_audio_diagnostics)},
 		{"compact_luxury_display_on_city_screen"                 , false, offsetof (struct c3x_config, compact_luxury_display_on_city_screen)},
 		{"compact_strategic_resource_display_on_city_screen"     , false, offsetof (struct c3x_config, compact_strategic_resource_display_on_city_screen)},
 		{"warn_when_chosen_building_would_replace_another"       , false, offsetof (struct c3x_config, warn_when_chosen_building_would_replace_another)},
@@ -20338,7 +20337,6 @@ patch_init_floating_point ()
 		int offset;
 	} integer_config_options[] = {
 		{"limit_railroad_movement"                           ,     0,  offsetof (struct c3x_config, limit_railroad_movement)},
-		{"stuck_sound_effect_timeout"                        ,    15,  offsetof (struct c3x_config, stuck_sound_effect_timeout)},
 		{"minimum_city_separation"                           ,     1,  offsetof (struct c3x_config, minimum_city_separation)},
 		{"anarchy_length_percent"                            ,   100,  offsetof (struct c3x_config, anarchy_length_percent)},
 		{"steal_plans_duration"                              ,     1,  offsetof (struct c3x_config, steal_plans_duration)},
@@ -20437,6 +20435,10 @@ patch_init_floating_point ()
 	WITH_MEM_PROTECTION (p_MessageBoxA, 4, PAGE_READWRITE)
 		*p_MessageBoxA = patch_MessageBoxA;
 
+	// Install the audio diagnostic hooks. This has to come after the block above that fills in the is-> function table, both because the hooks
+	// use those functions and because hooking GetProcAddress any earlier would intercept the mod's own lookups.
+	set_up_audio_diagnostics ();
+
 	// Set file path to mod's script.txt
 	snprintf (is->mod_script_path, sizeof is->mod_script_path, "%s\\Text\\c3x-script.txt", is->mod_rel_dir);
 	is->mod_script_path[(sizeof is->mod_script_path) - 1] = '\0';
@@ -20447,8 +20449,7 @@ patch_init_floating_point ()
 	base_config.sea_retreat_rules  = RR_STANDARD;
 	base_config.ai_settler_perfume_on_founding = 0;
 	base_config.work_area_limit = WAL_NONE;
-	base_config.draw_lines_using_gdi_plus = WWM_WINE;
-	base_config.stop_stuck_sound_effects = WWM_WINE;
+	base_config.draw_lines_using_gdi_plus = LDO_WINE;
 	base_config.double_minimap_size = MDM_HIGH_DEF;
 	base_config.combat_win_rate_display_mode = CWRDM_DETAILED;
 	base_config.override_no_ai_patrol = NAPO_NONE;
@@ -20631,16 +20632,6 @@ patch_init_floating_point ()
 	}
 
 	is->gdi_plus.init_state = IS_UNINITED;
-
-	// The watchdog's hooks aren't installed here because whether we install them depends on settings that haven't been read yet. That's done
-	// from patch_load_scenario instead, once the config files have been loaded.
-	is->sound_watchdog.init_state = IS_UNINITED;
-	is->sound_watchdog.hooked_vtable_count = 0;
-	for (int n = 0; n < MAX_LIVE_SOUNDS; n++) {
-		is->sound_watchdog.live_sounds[n].core = NULL;
-		is->sound_watchdog.live_sounds[n].playing = false;
-		is->sound_watchdog.live_sounds[n].path[0] = '\0';
-	}
 
 	is->water_trade_improvs    = (struct improv_id_list) {0};
 	is->air_trade_improvs      = (struct improv_id_list) {0};
@@ -24214,8 +24205,6 @@ append_improv_id_to_list (struct improv_id_list * list, int id)
 	list->count += 1;
 }
 
-bool set_up_sound_watchdog (); // defined down with the rest of the sound watchdog
-
 unsigned __fastcall
 patch_load_scenario (BIC * this, int edx, char * param_1, unsigned * param_2)
 {
@@ -24249,14 +24238,6 @@ patch_load_scenario (BIC * this, int edx, char * param_1, unsigned * param_2)
 	}
 	load_config ("custom.c3x_config.ini", 1);
 	apply_machine_code_edits (&is->current_config, false);
-
-	// Install the sound watchdog's hooks now that the settings have been read. This only does anything the first time it's reached. The hooks
-	// can't be taken back out, so turning these options on or off mid-session doesn't take effect until the game is restarted.
-	if ((is->sound_watchdog.init_state == IS_UNINITED) &&
-	    (is->current_config.log_sound_effect_activity ||
-	     (is->current_config.stop_stuck_sound_effects == WWM_ALWAYS) ||
-	     ((is->current_config.stop_stuck_sound_effects == WWM_WINE) && is->running_on_wine)))
-		set_up_sound_watchdog ();
 
 	if (is->current_config.enable_districts || is->current_config.enable_natural_wonders) {
 		reset_district_state (true);
@@ -34172,25 +34153,42 @@ patch_Trade_Net_set_unit_path_to_fill_road_net (Trade_Net * this, int edx, int f
 }
 
 //
-// Sound watchdog. Works around sound effects that loop forever when the game is run on Wine, including under Proton on Linux.
+// Audio diagnostics. Gathers evidence about the audio bugs that only appear when the game runs on Wine, including under Proton on Linux: unit and
+// ambience sound effects that repeat forever, and clicking in the music.
 //
-// The game plays all of its audio through sound.dll. AMB sounds, which is what unit and ambience sound effects are, repeat until something stops
-// them, so a stop that never happens (or never takes effect) leaves a sound running for the rest of the session. Rather than guess at why the stop
-// gets missed, we watch every sound the game starts and stop any that's been playing longer than a real sound effect ever lasts.
+// The leading suspect is timing. The game sequences its audio with Windows multimedia timers, which it imports from WINMM.dll, and its own Timer
+// object (see Civ3Conquests.h) is a thin wrapper over timeSetEvent, right down to the resolution field. One of those timers drives the ambience
+// sounds. AMB sounds are MIDI-sequenced WAV playback, so they depend on timer callbacks arriving on schedule to reach the end of the sequence, and
+// they repeat until stopped. Wine's multimedia timers are coarser and jitterier than the real thing, which would explain all of the symptoms at
+// once. That is a hypothesis, so the hooks below measure it rather than act on it.
 //
-// We find sound.dll's create_sound and delete_sound in the game's import table and replace those entries, the same trick used for MessageBoxA. That
-// tells us when sound objects come and go. To know when one actually starts and stops playing we also hook Play and Stop in the sound object's
-// vtable, since the game creates sound objects well before it plays them.
+// Everything here calls through to the original function and only logs. None of it changes the game's behavior. Logging goes through
+// OutputDebugString like the rest of the mod; on Linux you can read it by launching the game with WINEDEBUG=+debugstr.
 //
-// Logging goes through OutputDebugString like everywhere else in the mod. On Linux you can read it by launching the game with WINEDEBUG=+debugstr.
+// Note that sound.dll is NOT in the game's import table, it's loaded dynamically, which is why the hooks for it go through GetProcAddress rather
+// than through find_import_slot.
 //
 
-// Finds the import address table slot the game uses to call a function from another DLL, or NULL if the game doesn't import it. We locate this by
-// walking the PE import directory at runtime instead of hardcoding an address so that one code path works for every EXE version.
-void **
-find_import_slot (char const * dll_name, char const * func_name)
+// Returns true if this kind of event should still be logged. Each kind goes quiet after MAX_AUDIO_DIAG_LOGS so that a function the game calls
+// constantly can't bury everything else.
+bool
+should_log_audio_diag (enum audio_diag_kind kind)
 {
-	byte * image = (byte *)(*p_GetModuleHandleA) (NULL);
+	if (! is->current_config.log_audio_diagnostics)
+		return false;
+	if (is->audio_diagnostics.log_counts[kind] >= MAX_AUDIO_DIAG_LOGS)
+		return false;
+	is->audio_diagnostics.log_counts[kind] += 1;
+	return true;
+}
+
+// Finds the import address table slot "module" uses to call a function from another DLL, or NULL if it doesn't import it. Pass NULL for the module
+// to search the game's own executable. We walk the PE import directory at runtime instead of hardcoding an address so that one code path works for
+// every EXE version, and so we can look inside sound.dll as well.
+void **
+find_import_slot (HMODULE module, char const * dll_name, char const * func_name)
+{
+	byte * image = (byte *)((module != NULL) ? module : (*p_GetModuleHandleA) (NULL));
 	if (image == NULL)
 		return NULL;
 
@@ -34209,7 +34207,7 @@ find_import_slot (char const * dll_name, char const * func_name)
 		if (_stricmp ((char *)(image + desc->Name), dll_name) != 0)
 			continue;
 
-		// OriginalFirstThunk holds the imported names while FirstThunk holds the addresses the game actually calls through. The loader
+		// OriginalFirstThunk holds the imported names while FirstThunk holds the addresses the module actually calls through. The loader
 		// overwrites FirstThunk, so if the linker didn't emit OriginalFirstThunk there's no way left to match names to slots.
 		if (desc->OriginalFirstThunk == 0)
 			return NULL;
@@ -34241,272 +34239,236 @@ replace_import (void ** slot, void * replacement)
 	return original;
 }
 
-// Returns the watchdog's entry for a sound core, or NULL if it isn't being tracked.
-struct live_sound *
-find_live_sound (Sound_Core * core)
+//
+// The winmm timer hooks. The game's sound timers are set up at startup, so these have to be installed before the game gets going.
+//
+
+unsigned WINAPI
+patch_timeGetDevCaps (C3X_TIMECAPS * caps, unsigned size)
 {
-	if (core == NULL)
-		return NULL;
-	for (int n = 0; n < MAX_LIVE_SOUNDS; n++)
-		if (is->sound_watchdog.live_sounds[n].core == core)
-			return &is->sound_watchdog.live_sounds[n];
-	return NULL;
-}
+	unsigned result = is->audio_diagnostics.timeGetDevCaps (caps, size);
 
-int __fastcall patch_Sound_Core_Play (Sound_Core * this, int edx);
-int __fastcall patch_Sound_Core_Stop (Sound_Core * this, int edx);
-
-// Replaces Play and Stop in a sound core's vtable with our own versions, unless we've already done that for this vtable. Sound cores of the same
-// kind share a vtable, so this only does real work the first few times it's called.
-void
-hook_sound_core_vtable (Sound_Core * core)
-{
-	struct sound_watchdog * sw = &is->sound_watchdog;
-	char ss[300];
-
-	if ((core == NULL) || (core->vtable == NULL))
-		return;
-
-	for (int n = 0; n < sw->hooked_vtable_count; n++)
-		if (sw->hooked_vtables[n] == core->vtable)
-			return;
-
-	if (sw->hooked_vtable_count >= MAX_HOOKED_SOUND_VTABLES) {
-		snprintf (ss, sizeof ss, "C3X sound: out of room to hook sound core vtables, sounds using 0x%p won't be watched\n", core->vtable);
-		(*p_OutputDebugStringA) (ss);
-		return;
-	}
-
-	// Every sound core vtable seen so far points Play and Stop at the same implementations. If that ever stops being true we'd end up calling
-	// the wrong original, so check first and leave the vtable alone if it doesn't match the one we already know.
-	if (sw->hooked_vtable_count > 0) {
-		if ((core->vtable->Play != sw->Play) || (core->vtable->Stop != sw->Stop)) {
-			snprintf (ss, sizeof ss, "C3X sound: vtable 0x%p has unfamiliar Play/Stop, not hooking it\n", core->vtable);
-			(*p_OutputDebugStringA) (ss);
-			return;
-		}
-	} else {
-		sw->Play = core->vtable->Play;
-		sw->Stop = core->vtable->Stop;
-	}
-
-	// Play and Stop sit next to each other in the vtable so one call covers both.
-	WITH_MEM_PROTECTION (&core->vtable->Play, 2 * sizeof (void *), PAGE_READWRITE) {
-		core->vtable->Play = patch_Sound_Core_Play;
-		core->vtable->Stop = patch_Sound_Core_Stop;
-	}
-	sw->hooked_vtables[sw->hooked_vtable_count++] = core->vtable;
-
-	if (is->current_config.log_sound_effect_activity) {
-		snprintf (ss, sizeof ss, "C3X sound: hooked sound core vtable 0x%p\n", core->vtable);
-		(*p_OutputDebugStringA) (ss);
-	}
-}
-
-int __cdecl
-patch_create_sound (Sound_Core ** out_sound_core, char const * file_path, int sound_core_type)
-{
-	int result = is->sound_watchdog.create_sound (out_sound_core, file_path, sound_core_type);
-	char const * path_for_log = (file_path != NULL) ? file_path : "(none)";
-	char ss[300];
-
-	if ((result != 0) || (out_sound_core == NULL) || (*out_sound_core == NULL)) {
-		if (is->current_config.log_sound_effect_activity) {
-			snprintf (ss, sizeof ss, "C3X sound: create_sound(\"%s\", type %d) failed with %d\n", path_for_log, sound_core_type, result);
-			(*p_OutputDebugStringA) (ss);
-		}
-		return result;
-	}
-
-	Sound_Core * core = *out_sound_core;
-	hook_sound_core_vtable (core);
-
-	// The game reuses sound objects, so there may already be an entry for this exact pointer left over from an earlier life. Overwrite that one
-	// if so, otherwise take the first free slot.
-	struct live_sound * slot = find_live_sound (core);
-	if (slot == NULL)
-		slot = find_live_sound (NULL);
-	if (slot != NULL) {
-		slot->core = core;
-		slot->playing = false;
-		slot->started_at.QuadPart = 0;
-		if (file_path != NULL) {
-			strncpy (slot->path, file_path, SOUND_PATH_LEN - 1);
-			slot->path[SOUND_PATH_LEN - 1] = '\0';
-		} else
-			slot->path[0] = '\0';
-	} else {
-		snprintf (ss, sizeof ss, "C3X sound: no free slots left to watch \"%s\"\n", path_for_log);
+	// The interesting number is wPeriodMin. Windows reports 1 ms. If Wine reports something coarser then the game can't ask for the resolution
+	// it wants and every timer it sets up will fire late, which is the thing we're looking for.
+	if (should_log_audio_diag (ADK_TIME_GET_DEV_CAPS)) {
+		char ss[300];
+		if ((result == 0) && (caps != NULL) && (size >= sizeof *caps))
+			snprintf (ss, sizeof ss, "C3X audio: timeGetDevCaps -> periodMin %u ms, periodMax %u ms\n", caps->wPeriodMin, caps->wPeriodMax);
+		else
+			snprintf (ss, sizeof ss, "C3X audio: timeGetDevCaps failed, returned %u\n", result);
+		ss[(sizeof ss) - 1] = '\0';
 		(*p_OutputDebugStringA) (ss);
 	}
 
-	if (is->current_config.log_sound_effect_activity) {
-		snprintf (ss, sizeof ss, "C3X sound: created 0x%p \"%s\" type %d\n", core, path_for_log, sound_core_type);
-		(*p_OutputDebugStringA) (ss);
-	}
 	return result;
 }
 
-int __cdecl
-patch_delete_sound (Sound_Core * sound_core)
+unsigned WINAPI
+patch_timeBeginPeriod (unsigned period)
 {
-	struct live_sound * slot = find_live_sound (sound_core);
+	unsigned result = is->audio_diagnostics.timeBeginPeriod (period);
 
-	if (is->current_config.log_sound_effect_activity) {
+	if (should_log_audio_diag (ADK_TIME_BEGIN_PERIOD)) {
 		char ss[300];
-		snprintf (ss, sizeof ss, "C3X sound: deleted 0x%p \"%s\"\n", sound_core, (slot != NULL) ? slot->path : "(untracked)");
+		snprintf (ss, sizeof ss, "C3X audio: timeBeginPeriod(%u ms) returned %u (0 means it was granted)\n", period, result);
+		ss[(sizeof ss) - 1] = '\0';
 		(*p_OutputDebugStringA) (ss);
 	}
 
-	if (slot != NULL) {
-		slot->core = NULL;
-		slot->playing = false;
-		slot->path[0] = '\0';
-	}
-
-	return is->sound_watchdog.delete_sound (sound_core);
+	return result;
 }
 
-int __fastcall
-patch_Sound_Core_Play (Sound_Core * this, int edx)
+unsigned WINAPI
+patch_timeEndPeriod (unsigned period)
 {
-	struct live_sound * slot = find_live_sound (this);
-	if (slot != NULL) {
-		slot->playing = true;
-		QueryPerformanceCounter (&slot->started_at);
-	}
+	unsigned result = is->audio_diagnostics.timeEndPeriod (period);
 
-	if (is->current_config.log_sound_effect_activity) {
+	if (should_log_audio_diag (ADK_TIME_END_PERIOD)) {
 		char ss[300];
-		snprintf (ss, sizeof ss, "C3X sound: play 0x%p \"%s\"\n", this, (slot != NULL) ? slot->path : "(untracked)");
+		snprintf (ss, sizeof ss, "C3X audio: timeEndPeriod(%u ms) returned %u\n", period, result);
+		ss[(sizeof ss) - 1] = '\0';
 		(*p_OutputDebugStringA) (ss);
 	}
 
-	return is->sound_watchdog.Play (this, __);
+	return result;
 }
 
-int __fastcall
-patch_Sound_Core_Stop (Sound_Core * this, int edx)
+unsigned WINAPI
+patch_timeSetEvent (unsigned delay, unsigned resolution, void * callback, unsigned user_data, unsigned flags)
 {
-	struct live_sound * slot = find_live_sound (this);
-	if (slot != NULL)
-		slot->playing = false;
+	unsigned timer_id = is->audio_diagnostics.timeSetEvent (delay, resolution, callback, user_data, flags);
 
-	if (is->current_config.log_sound_effect_activity) {
+	// Low bit of the flags picks the callback style, and bit 1 is set for a periodic timer as opposed to a one shot. What we want to see is the
+	// delay and resolution the game asks for, and whether the timer was created at all (an ID of zero means it wasn't).
+	if (should_log_audio_diag (ADK_TIME_SET_EVENT)) {
 		char ss[300];
-		snprintf (ss, sizeof ss, "C3X sound: stop 0x%p \"%s\"\n", this, (slot != NULL) ? slot->path : "(untracked)");
+		snprintf (ss, sizeof ss, "C3X audio: timeSetEvent(delay %u ms, resolution %u ms, flags 0x%x) -> timer %u%s\n",
+			  delay, resolution, flags, timer_id, (timer_id == 0) ? " (FAILED)" : "");
+		ss[(sizeof ss) - 1] = '\0';
 		(*p_OutputDebugStringA) (ss);
 	}
 
-	return is->sound_watchdog.Stop (this, __);
+	return timer_id;
 }
 
-// Stops any sound that's been playing for longer than a sound effect plausibly lasts. Called from patch_Animator_update, so it runs while the map is
-// on screen, which is where the sounds that get stuck are played.
+unsigned WINAPI
+patch_timeKillEvent (unsigned timer_id)
+{
+	unsigned result = is->audio_diagnostics.timeKillEvent (timer_id);
+
+	if (should_log_audio_diag (ADK_TIME_KILL_EVENT)) {
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: timeKillEvent(timer %u) returned %u\n", timer_id, result);
+		ss[(sizeof ss) - 1] = '\0';
+		(*p_OutputDebugStringA) (ss);
+	}
+
+	return result;
+}
+
+//
+// Hooks for watching sound.dll. Since it isn't statically imported we can't hook its functions directly, but we can watch the game load it and
+// resolve its exports.
+//
+
+// Logs which DLLs sound.dll itself imports the interesting functions from. This is what tells us where the audio actually gets pumped: if sound.dll
+// runs its own multimedia timer, or talks to DirectSound, then hooking the executable's imports would never reach it and a fix would have to go
+// into sound.dll's import table instead.
 void
-service_sound_watchdog ()
+report_sound_dll_imports ()
 {
-	struct sound_watchdog * sw = &is->sound_watchdog;
-
-	if ((sw->init_state != IS_OK) ||
-	    (is->current_config.stop_stuck_sound_effects == WWM_NEVER) ||
-	    ((is->current_config.stop_stuck_sound_effects == WWM_WINE) && ! is->running_on_wine))
-		return;
-
-	int timeout = is->current_config.stuck_sound_effect_timeout;
-	if (timeout <= 0)
-		return;
-
-	LARGE_INTEGER perf_freq, now;
-	if ((! QueryPerformanceFrequency (&perf_freq)) || (perf_freq.QuadPart <= 0) || (! QueryPerformanceCounter (&now)))
-		return;
-
-	for (int n = 0; n < MAX_LIVE_SOUNDS; n++) {
-		struct live_sound * slot = &sw->live_sounds[n];
-		if ((slot->core == NULL) || ! slot->playing)
-			continue;
-
-		double elapsed = (double)(now.QuadPart - slot->started_at.QuadPart) / (double)perf_freq.QuadPart;
-		if (elapsed < (double)timeout)
-			continue;
-
-		// We only know a sound has gone away when delete_sound is called. If the game ever disposes of one some other way, our pointer is
-		// left dangling and calling Stop through it would crash. Checking that it still carries a vtable we hooked is a cheap way to catch
-		// that: freed memory almost certainly won't. Drop the entry rather than risk the call.
-		bool vtable_is_ours = false;
-		for (int i = 0; i < sw->hooked_vtable_count; i++)
-			if (slot->core->vtable == sw->hooked_vtables[i]) {
-				vtable_is_ours = true;
-				break;
-			}
-		if (! vtable_is_ours) {
-			char ss[300];
-			snprintf (ss, sizeof ss, "C3X sound: sound 0x%p \"%s\" no longer looks like a sound object, dropping it\n",
-				  slot->core, slot->path);
-			(*p_OutputDebugStringA) (ss);
-			slot->core = NULL;
-			slot->playing = false;
-			slot->path[0] = '\0';
-			continue;
-		}
-
-		// Clear the flag before stopping so that a sound we turn out not to be able to silence doesn't get a stop call every single frame.
-		slot->playing = false;
-		int stop_result = sw->Stop (slot->core, __);
-
-		char ss[300];
-		snprintf (ss, sizeof ss, "C3X sound: stopped stuck sound 0x%p \"%s\" after %d sec, stop returned %d\n",
-			  slot->core, slot->path, (int)elapsed, stop_result);
-		(*p_OutputDebugStringA) (ss);
-	}
-}
-
-// Hooks sound.dll's create_sound and delete_sound so the watchdog can see the sounds the game plays. Called once, from patch_load_scenario, after
-// the config has been read. Returns true if the hooks went in.
-bool
-set_up_sound_watchdog ()
-{
-	struct sound_watchdog * sw = &is->sound_watchdog;
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
 	char ss[300];
 
-	sw->p_create_sound = find_import_slot ("sound.dll", "create_sound");
-	sw->p_delete_sound = find_import_slot ("sound.dll", "delete_sound");
-	if ((sw->p_create_sound == NULL) || (sw->p_delete_sound == NULL)) {
-		// Not worth interrupting the player over. It just means sounds go unwatched, so the game behaves as it would without this option.
-		(*p_OutputDebugStringA) ("C3X sound: couldn't find create_sound/delete_sound in the import table, sound watchdog disabled\n");
-		sw->init_state = IS_INIT_FAILED;
-		return false;
-	}
+	if (ad->reported_sound_imports || (ad->sound_module == NULL) || ! is->current_config.log_audio_diagnostics)
+		return;
+	ad->reported_sound_imports = true;
 
-	sw->create_sound = (void *)replace_import (sw->p_create_sound, patch_create_sound);
-	if (sw->create_sound == NULL) {
-		(*p_OutputDebugStringA) ("C3X sound: couldn't replace the create_sound import, sound watchdog disabled\n");
-		sw->init_state = IS_INIT_FAILED;
-		return false;
-	}
+	struct { char const * dll; char const * func; } const to_check[] = {
+		{"winmm.dll",  "timeSetEvent"},
+		{"winmm.dll",  "timeBeginPeriod"},
+		{"winmm.dll",  "waveOutWrite"},
+		{"winmm.dll",  "waveOutOpen"},
+		{"winmm.dll",  "midiOutShortMsg"},
+		{"dsound.dll", "DirectSoundCreate"}
+	};
 
-	sw->delete_sound = (void *)replace_import (sw->p_delete_sound, patch_delete_sound);
-	if (sw->delete_sound == NULL) {
-		// Put create_sound back so we don't leave half a hook installed, calling into a watchdog that will never run.
-		replace_import (sw->p_create_sound, sw->create_sound);
-		sw->create_sound = NULL;
-		(*p_OutputDebugStringA) ("C3X sound: couldn't replace the delete_sound import, sound watchdog disabled\n");
-		sw->init_state = IS_INIT_FAILED;
-		return false;
+	for (int n = 0; n < ARRAY_LEN (to_check); n++) {
+		void ** slot = find_import_slot (ad->sound_module, to_check[n].dll, to_check[n].func);
+		snprintf (ss, sizeof ss, "C3X audio: sound.dll imports %s!%s: %s\n",
+			  to_check[n].dll, to_check[n].func, (slot != NULL) ? "yes" : "no");
+		ss[(sizeof ss) - 1] = '\0';
+		(*p_OutputDebugStringA) (ss);
 	}
-
-	sw->init_state = IS_OK;
-	snprintf (ss, sizeof ss, "C3X sound: watchdog installed, stopping sounds stuck for more than %d sec\n",
-		  is->current_config.stuck_sound_effect_timeout);
-	(*p_OutputDebugStringA) (ss);
-	return true;
 }
 
-void __fastcall
-patch_Animator_update (Animator * this)
+// True if the path or module name refers to sound.dll. The game may pass a full path, so match the file name at the end.
+bool
+names_sound_dll (char const * name)
 {
-	Animator_update (this);
-	service_sound_watchdog ();
+	if (name == NULL)
+		return false;
+
+	char const * file_name = name;
+	for (char const * c = name; *c != '\0'; c++)
+		if ((*c == '\\') || (*c == '/'))
+			file_name = c + 1;
+
+	return _stricmp (file_name, "sound.dll") == 0;
+}
+
+HMODULE WINAPI
+patch_audio_diag_LoadLibraryA (char const * file_name)
+{
+	HMODULE result = is->audio_diagnostics.orig_load_library (file_name);
+
+	if (names_sound_dll (file_name)) {
+		is->audio_diagnostics.sound_module = result;
+		if (should_log_audio_diag (ADK_LOAD_LIBRARY)) {
+			char ss[300];
+			snprintf (ss, sizeof ss, "C3X audio: game loaded \"%s\" -> module 0x%p\n", file_name, result);
+			ss[(sizeof ss) - 1] = '\0';
+			(*p_OutputDebugStringA) (ss);
+		}
+		report_sound_dll_imports ();
+	}
+
+	return result;
+}
+
+FARPROC WINAPI
+patch_audio_diag_GetProcAddress (HMODULE module, char const * proc_name)
+{
+	// Must call the saved original rather than going through p_GetProcAddress, which now points here and would recurse forever.
+	FARPROC result = is->audio_diagnostics.orig_get_proc_address (module, proc_name);
+
+	// Only interested in sound.dll. Everything else goes straight through.
+	if ((module == NULL) || (module != is->audio_diagnostics.sound_module))
+		return result;
+
+	report_sound_dll_imports (); // no-op unless it hasn't been done yet, which is the case if logging got turned on after sound.dll loaded
+
+	if (should_log_audio_diag (ADK_GET_PROC_ADDRESS)) {
+		char ss[300];
+		// Exports can be requested by ordinal instead of by name, in which case the "name" is a small integer rather than a pointer. That's
+		// how Civ 3 asks for the wave and midi device constructors, whose real names are C++ mangled.
+		if (((unsigned)proc_name & 0xFFFF0000) == 0)
+			snprintf (ss, sizeof ss, "C3X audio: game resolved sound.dll ordinal %u -> 0x%p\n", (unsigned)proc_name, result);
+		else
+			snprintf (ss, sizeof ss, "C3X audio: game resolved sound.dll \"%s\" -> 0x%p\n", proc_name, result);
+		ss[(sizeof ss) - 1] = '\0';
+		(*p_OutputDebugStringA) (ss);
+	}
+
+	return result;
+}
+
+// Installs all of the diagnostic hooks. Called from patch_init_floating_point, which runs at the end of CRT initialization, before the game's global
+// constructors and long before it sets up its sound timers or loads sound.dll.
+//
+// The hooks go in whether or not log_audio_diagnostics is set, because the config files haven't been read at this point and the calls worth seeing
+// happen during startup. They're pass-throughs that check the setting before logging anything, so leaving them installed costs a branch per call and
+// lets the option be turned on without restarting the game.
+void
+set_up_audio_diagnostics ()
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+
+	*ad = (struct audio_diagnostics) {0};
+
+	struct { char const * name; void * replacement; void ** p_original; } const winmm_hooks[] = {
+		{"timeGetDevCaps" , patch_timeGetDevCaps , (void **)&ad->timeGetDevCaps },
+		{"timeBeginPeriod", patch_timeBeginPeriod, (void **)&ad->timeBeginPeriod},
+		{"timeEndPeriod"  , patch_timeEndPeriod  , (void **)&ad->timeEndPeriod  },
+		{"timeSetEvent"   , patch_timeSetEvent   , (void **)&ad->timeSetEvent   },
+		{"timeKillEvent"  , patch_timeKillEvent  , (void **)&ad->timeKillEvent  }
+	};
+
+	// Throughout, the original is recorded before the slot is redirected, never after, so a hook can never run without knowing what to call
+	// through to.
+	for (int n = 0; n < ARRAY_LEN (winmm_hooks); n++) {
+		void ** slot = find_import_slot (NULL, "winmm.dll", winmm_hooks[n].name);
+		if (slot != NULL) {
+			*winmm_hooks[n].p_original = *slot;
+			replace_import (slot, winmm_hooks[n].replacement);
+		}
+	}
+
+	// Watch the game load sound.dll and resolve its exports. sound.dll isn't statically imported so this is the only way to see it happen.
+	void ** load_library_slot = find_import_slot (NULL, "kernel32.dll", "LoadLibraryA");
+	if (load_library_slot != NULL) {
+		ad->orig_load_library = (void *)*load_library_slot;
+		replace_import (load_library_slot, patch_audio_diag_LoadLibraryA);
+	}
+
+	// p_GetProcAddress points at this same slot, so from here on the mod's own lookups go through the hook too. That's harmless, and the mod has
+	// already finished resolving everything it needs by this point.
+	ad->orig_get_proc_address = (void *)*(void **)p_GetProcAddress;
+	replace_import ((void **)p_GetProcAddress, patch_audio_diag_GetProcAddress);
+
+	// In case sound.dll was already loaded before we got here.
+	if (ad->sound_module == NULL)
+		ad->sound_module = (*p_GetModuleHandleA) ("sound.dll");
 }
 
 bool
@@ -34566,8 +34528,8 @@ set_up_gdi_plus ()
 int __fastcall
 patch_OpenGLRenderer_initialize (OpenGLRenderer * this, int edx, PCX_Image * texture)
 {
-	if ((is->current_config.draw_lines_using_gdi_plus == WWM_NEVER) ||
-	    ((is->current_config.draw_lines_using_gdi_plus == WWM_WINE) && ! is->running_on_wine))
+	if ((is->current_config.draw_lines_using_gdi_plus == LDO_NEVER) ||
+	    ((is->current_config.draw_lines_using_gdi_plus == LDO_WINE) && ! is->running_on_wine))
 		return OpenGLRenderer_initialize (this, __, texture);
 
 	// Initialize GDI+ instead
@@ -34636,8 +34598,8 @@ patch_OpenGLRenderer_disable_line_dashing (OpenGLRenderer * this)
 void __fastcall
 patch_OpenGLRenderer_draw_line (OpenGLRenderer * this, int edx, int x1, int y1, int x2, int y2)
 {
-	if ((is->current_config.draw_lines_using_gdi_plus == WWM_NEVER) ||
-	    ((is->current_config.draw_lines_using_gdi_plus == WWM_WINE) && ! is->running_on_wine))
+	if ((is->current_config.draw_lines_using_gdi_plus == LDO_NEVER) ||
+	    ((is->current_config.draw_lines_using_gdi_plus == LDO_WINE) && ! is->running_on_wine))
 		OpenGLRenderer_draw_line (this, __, x1, y1, x2, y2);
 
 	else if ((is->gdi_plus.init_state == IS_OK) && (is->gdi_plus.gp_graphics != NULL)) {

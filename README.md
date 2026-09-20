@@ -101,7 +101,6 @@ All C3X features are listed below. See the default config (default.c3x\_config.i
    - Disallow useless bombard attacks vs airfields
    - Display total city count (disabled by default, appears on demographics screen)
    - Fix graphical issues when running on Wine
-   - Fix sound effects looping forever when running on Wine
    - Option to pack the lists of luxuries and strategic resources more tightly into their boxes on the city screen
    - Right-click menu enhancements
       - Place icons next to units showing movement and combat status

@@ -10,9 +10,7 @@
 - Allow unit type tags to be set by Civilopedia key or on all units with a given AI strategy or unit ability
 - Option remove_fresh_water_growth_bonus that makes all cities require aqueducts to grow to size level two, including those founded next to a river or lake
 - Option limit_detection_by_units_to_adjacent_tiles to restrict units' detect invisible ability to adjacent tiles
-- Fix sound effects looping forever when running on Wine
-  - Controlled by option stop_stuck_sound_effects, with stuck_sound_effect_timeout to adjust how long a sound may play before it's considered stuck
-  - Troubleshooting option log_sound_effect_activity records the sounds the game plays
+- Option log_audio_diagnostics to help track down the sound problems that occur when running on Wine
 - Fix city governors unable to assign workers to improvement-type districts after construction
 - Fix can_bombard_only_sea_tiles not applying to AI units or aerial defensive bombard
 - Fix some ways areas revealed by recon can stay permanently revealed
