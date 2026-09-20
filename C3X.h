@@ -403,6 +403,7 @@ struct c3x_config {
 	bool prefer_less_expensive_defenders;
 	bool show_untradable_techs_on_trade_screen;
 	bool disallow_useless_bombard_vs_airfields;
+	bool log_audio_diagnostics;
 	enum line_drawing_override draw_lines_using_gdi_plus;
 	bool compact_luxury_display_on_city_screen;
 	bool compact_strategic_resource_display_on_city_screen;
@@ -702,6 +703,28 @@ enum init_state {
 	IS_OK,
 	IS_INIT_FAILED
 };
+
+// Pieces of the Windows multimedia timer API, which the game imports from WINMM.dll and uses to drive its audio. These are declared here because
+// the compiler's headers don't include mmsystem.h. The parameter types are spelled out with plain integers since we only pass them through.
+typedef struct {
+	unsigned wPeriodMin;
+	unsigned wPeriodMax;
+} C3X_TIMECAPS;
+
+// The audio diagnostics hook one function each. Used to index audio_diagnostics.log_counts so that one chatty function can't flood the log.
+enum audio_diag_kind {
+	ADK_TIME_GET_DEV_CAPS = 0,
+	ADK_TIME_BEGIN_PERIOD,
+	ADK_TIME_END_PERIOD,
+	ADK_TIME_SET_EVENT,
+	ADK_TIME_KILL_EVENT,
+	ADK_GET_PROC_ADDRESS,
+	ADK_LOAD_LIBRARY,
+	COUNT_ADK
+};
+
+// How many times each hooked function will log before going quiet. timeSetEvent in particular may be called over and over for one-shot timers.
+#define MAX_AUDIO_DIAG_LOGS 50
 
 enum c3x_label {
 	CL_NEVER_COMPLETES = 0,
@@ -2297,6 +2320,28 @@ struct injected_state {
 		int (__stdcall * DeletePen) (void * gp_pen);
 		int (__stdcall * DrawLineI) (void * gp_graphics, void * gp_pen, int x1, int y1, int x2, int y2);
 	} gdi_plus;
+
+	// Diagnostics for the audio problems that only appear on Wine: sound effects that repeat forever and clicking in the music. The game
+	// sequences its audio with Windows multimedia timers, whose timing Wine handles differently, so these hooks report how those timers are set
+	// up and which parts of sound.dll the game uses. Everything here only logs. None of it changes what the game does.
+	// Valid any time after patch_init_floating_point.
+	struct audio_diagnostics {
+		// Originals of the functions we hooked, so the hooks can call through. NULL means we couldn't hook that one.
+		unsigned (WINAPI * timeGetDevCaps) (C3X_TIMECAPS *, unsigned);
+		unsigned (WINAPI * timeBeginPeriod) (unsigned);
+		unsigned (WINAPI * timeEndPeriod) (unsigned);
+		unsigned (WINAPI * timeSetEvent) (unsigned, unsigned, void *, unsigned, unsigned);
+		unsigned (WINAPI * timeKillEvent) (unsigned);
+		// Named differently from the Win32 functions they hold because injected_code.c #defines LoadLibraryA to an is-> lookup, which would
+		// otherwise rewrite the field name out from under us.
+		FARPROC (WINAPI * orig_get_proc_address) (HMODULE, char const *);
+		HMODULE (WINAPI * orig_load_library) (char const *);
+
+		HMODULE sound_module; // sound.dll once we've seen the game load it, NULL before then
+		bool reported_sound_imports; // so we only walk and report sound.dll's import table once
+
+		int log_counts[COUNT_ADK];
+	} audio_diagnostics;
 
 	// These variables track the states of some OpenGL parameters. They're updated whenever methods like OpenGLRenderer::set_color are called.
 	unsigned int ogl_color;

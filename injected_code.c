@@ -20119,6 +20119,8 @@ patch_Map_Renderer_load_images (Map_Renderer *this, int edx)
 	}
 }
 
+void set_up_audio_diagnostics (); // defined down with the rest of the audio diagnostics
+
 void
 patch_init_floating_point ()
 {
@@ -20236,6 +20238,7 @@ patch_init_floating_point ()
 		{"prefer_less_expensive_defenders"                        , false, offsetof (struct c3x_config, prefer_less_expensive_defenders)},
 		{"show_untradable_techs_on_trade_screen"                 , false, offsetof (struct c3x_config, show_untradable_techs_on_trade_screen)},
 		{"disallow_useless_bombard_vs_airfields"                 , true , offsetof (struct c3x_config, disallow_useless_bombard_vs_airfields)},
+		{"log_audio_diagnostics"                                 , false, offsetof (struct c3x_config, log_audio_diagnostics)},
 		{"compact_luxury_display_on_city_screen"                 , false, offsetof (struct c3x_config, compact_luxury_display_on_city_screen)},
 		{"compact_strategic_resource_display_on_city_screen"     , false, offsetof (struct c3x_config, compact_strategic_resource_display_on_city_screen)},
 		{"warn_when_chosen_building_would_replace_another"       , false, offsetof (struct c3x_config, warn_when_chosen_building_would_replace_another)},
@@ -20431,6 +20434,10 @@ patch_init_floating_point ()
 	// Intercept the game's calls to MessageBoxA. We can't do this through the patcher since that would interfere with the runtime loader.
 	WITH_MEM_PROTECTION (p_MessageBoxA, 4, PAGE_READWRITE)
 		*p_MessageBoxA = patch_MessageBoxA;
+
+	// Install the audio diagnostic hooks. This has to come after the block above that fills in the is-> function table, both because the hooks
+	// use those functions and because hooking GetProcAddress any earlier would intercept the mod's own lookups.
+	set_up_audio_diagnostics ();
 
 	// Set file path to mod's script.txt
 	snprintf (is->mod_script_path, sizeof is->mod_script_path, "%s\\Text\\c3x-script.txt", is->mod_rel_dir);
@@ -34143,6 +34150,325 @@ patch_Trade_Net_set_unit_path_to_fill_road_net (Trade_Net * this, int edx, int f
 	QueryPerformanceCounter ((LARGE_INTEGER *)&ts_after);
 	is->time_spent_filling_roads += ts_after - ts_before;
 	return tr;
+}
+
+//
+// Audio diagnostics. Gathers evidence about the audio bugs that only appear when the game runs on Wine, including under Proton on Linux: unit and
+// ambience sound effects that repeat forever, and clicking in the music.
+//
+// The leading suspect is timing. The game sequences its audio with Windows multimedia timers, which it imports from WINMM.dll, and its own Timer
+// object (see Civ3Conquests.h) is a thin wrapper over timeSetEvent, right down to the resolution field. One of those timers drives the ambience
+// sounds. AMB sounds are MIDI-sequenced WAV playback, so they depend on timer callbacks arriving on schedule to reach the end of the sequence, and
+// they repeat until stopped. Wine's multimedia timers are coarser and jitterier than the real thing, which would explain all of the symptoms at
+// once. That is a hypothesis, so the hooks below measure it rather than act on it.
+//
+// Everything here calls through to the original function and only logs. None of it changes the game's behavior. Logging goes through
+// OutputDebugString like the rest of the mod; on Linux you can read it by launching the game with WINEDEBUG=+debugstr.
+//
+// Note that sound.dll is NOT in the game's import table, it's loaded dynamically, which is why the hooks for it go through GetProcAddress rather
+// than through find_import_slot.
+//
+
+// Returns true if this kind of event should still be logged. Each kind goes quiet after MAX_AUDIO_DIAG_LOGS so that a function the game calls
+// constantly can't bury everything else.
+bool
+should_log_audio_diag (enum audio_diag_kind kind)
+{
+	if (! is->current_config.log_audio_diagnostics)
+		return false;
+	if (is->audio_diagnostics.log_counts[kind] >= MAX_AUDIO_DIAG_LOGS)
+		return false;
+	is->audio_diagnostics.log_counts[kind] += 1;
+	return true;
+}
+
+// Finds the import address table slot "module" uses to call a function from another DLL, or NULL if it doesn't import it. Pass NULL for the module
+// to search the game's own executable. We walk the PE import directory at runtime instead of hardcoding an address so that one code path works for
+// every EXE version, and so we can look inside sound.dll as well.
+void **
+find_import_slot (HMODULE module, char const * dll_name, char const * func_name)
+{
+	byte * image = (byte *)((module != NULL) ? module : (*p_GetModuleHandleA) (NULL));
+	if (image == NULL)
+		return NULL;
+
+	IMAGE_DOS_HEADER * dos_header = (IMAGE_DOS_HEADER *)image;
+	if (dos_header->e_magic != IMAGE_DOS_SIGNATURE)
+		return NULL;
+	IMAGE_NT_HEADERS * nt_headers = (IMAGE_NT_HEADERS *)(image + dos_header->e_lfanew);
+	if (nt_headers->Signature != IMAGE_NT_SIGNATURE)
+		return NULL;
+
+	IMAGE_DATA_DIRECTORY * import_dir = &nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (import_dir->VirtualAddress == 0)
+		return NULL;
+
+	for (IMAGE_IMPORT_DESCRIPTOR * desc = (IMAGE_IMPORT_DESCRIPTOR *)(image + import_dir->VirtualAddress); desc->Name != 0; desc++) {
+		if (_stricmp ((char *)(image + desc->Name), dll_name) != 0)
+			continue;
+
+		// OriginalFirstThunk holds the imported names while FirstThunk holds the addresses the module actually calls through. The loader
+		// overwrites FirstThunk, so if the linker didn't emit OriginalFirstThunk there's no way left to match names to slots.
+		if (desc->OriginalFirstThunk == 0)
+			return NULL;
+
+		IMAGE_THUNK_DATA * names = (IMAGE_THUNK_DATA *)(image + desc->OriginalFirstThunk);
+		IMAGE_THUNK_DATA * addrs = (IMAGE_THUNK_DATA *)(image + desc->FirstThunk);
+		for (; names->u1.AddressOfData != 0; names++, addrs++) {
+			if (IMAGE_SNAP_BY_ORDINAL (names->u1.Ordinal))
+				continue; // imported by ordinal, so there's no name to compare against
+			IMAGE_IMPORT_BY_NAME * by_name = (IMAGE_IMPORT_BY_NAME *)(image + names->u1.AddressOfData);
+			if (strcmp ((char *)by_name->Name, func_name) == 0)
+				return (void **)&addrs->u1.Function;
+		}
+		return NULL; // found the DLL but not the function, so there's no point checking the other descriptors
+	}
+
+	return NULL;
+}
+
+// Writes over one import table slot and returns what was there before, or NULL if the write couldn't be done.
+void *
+replace_import (void ** slot, void * replacement)
+{
+	void * original = NULL;
+	WITH_MEM_PROTECTION (slot, sizeof *slot, PAGE_READWRITE) {
+		original = *slot;
+		*slot = replacement;
+	}
+	return original;
+}
+
+//
+// The winmm timer hooks. The game's sound timers are set up at startup, so these have to be installed before the game gets going.
+//
+
+unsigned WINAPI
+patch_timeGetDevCaps (C3X_TIMECAPS * caps, unsigned size)
+{
+	unsigned result = is->audio_diagnostics.timeGetDevCaps (caps, size);
+
+	// The interesting number is wPeriodMin. Windows reports 1 ms. If Wine reports something coarser then the game can't ask for the resolution
+	// it wants and every timer it sets up will fire late, which is the thing we're looking for.
+	if (should_log_audio_diag (ADK_TIME_GET_DEV_CAPS)) {
+		char ss[300];
+		if ((result == 0) && (caps != NULL) && (size >= sizeof *caps))
+			snprintf (ss, sizeof ss, "C3X audio: timeGetDevCaps -> periodMin %u ms, periodMax %u ms\n", caps->wPeriodMin, caps->wPeriodMax);
+		else
+			snprintf (ss, sizeof ss, "C3X audio: timeGetDevCaps failed, returned %u\n", result);
+		ss[(sizeof ss) - 1] = '\0';
+		(*p_OutputDebugStringA) (ss);
+	}
+
+	return result;
+}
+
+unsigned WINAPI
+patch_timeBeginPeriod (unsigned period)
+{
+	unsigned result = is->audio_diagnostics.timeBeginPeriod (period);
+
+	if (should_log_audio_diag (ADK_TIME_BEGIN_PERIOD)) {
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: timeBeginPeriod(%u ms) returned %u (0 means it was granted)\n", period, result);
+		ss[(sizeof ss) - 1] = '\0';
+		(*p_OutputDebugStringA) (ss);
+	}
+
+	return result;
+}
+
+unsigned WINAPI
+patch_timeEndPeriod (unsigned period)
+{
+	unsigned result = is->audio_diagnostics.timeEndPeriod (period);
+
+	if (should_log_audio_diag (ADK_TIME_END_PERIOD)) {
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: timeEndPeriod(%u ms) returned %u\n", period, result);
+		ss[(sizeof ss) - 1] = '\0';
+		(*p_OutputDebugStringA) (ss);
+	}
+
+	return result;
+}
+
+unsigned WINAPI
+patch_timeSetEvent (unsigned delay, unsigned resolution, void * callback, unsigned user_data, unsigned flags)
+{
+	unsigned timer_id = is->audio_diagnostics.timeSetEvent (delay, resolution, callback, user_data, flags);
+
+	// Low bit of the flags picks the callback style, and bit 1 is set for a periodic timer as opposed to a one shot. What we want to see is the
+	// delay and resolution the game asks for, and whether the timer was created at all (an ID of zero means it wasn't).
+	if (should_log_audio_diag (ADK_TIME_SET_EVENT)) {
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: timeSetEvent(delay %u ms, resolution %u ms, flags 0x%x) -> timer %u%s\n",
+			  delay, resolution, flags, timer_id, (timer_id == 0) ? " (FAILED)" : "");
+		ss[(sizeof ss) - 1] = '\0';
+		(*p_OutputDebugStringA) (ss);
+	}
+
+	return timer_id;
+}
+
+unsigned WINAPI
+patch_timeKillEvent (unsigned timer_id)
+{
+	unsigned result = is->audio_diagnostics.timeKillEvent (timer_id);
+
+	if (should_log_audio_diag (ADK_TIME_KILL_EVENT)) {
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: timeKillEvent(timer %u) returned %u\n", timer_id, result);
+		ss[(sizeof ss) - 1] = '\0';
+		(*p_OutputDebugStringA) (ss);
+	}
+
+	return result;
+}
+
+//
+// Hooks for watching sound.dll. Since it isn't statically imported we can't hook its functions directly, but we can watch the game load it and
+// resolve its exports.
+//
+
+// Logs which DLLs sound.dll itself imports the interesting functions from. This is what tells us where the audio actually gets pumped: if sound.dll
+// runs its own multimedia timer, or talks to DirectSound, then hooking the executable's imports would never reach it and a fix would have to go
+// into sound.dll's import table instead.
+void
+report_sound_dll_imports ()
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+	char ss[300];
+
+	if (ad->reported_sound_imports || (ad->sound_module == NULL) || ! is->current_config.log_audio_diagnostics)
+		return;
+	ad->reported_sound_imports = true;
+
+	struct { char const * dll; char const * func; } const to_check[] = {
+		{"winmm.dll",  "timeSetEvent"},
+		{"winmm.dll",  "timeBeginPeriod"},
+		{"winmm.dll",  "waveOutWrite"},
+		{"winmm.dll",  "waveOutOpen"},
+		{"winmm.dll",  "midiOutShortMsg"},
+		{"dsound.dll", "DirectSoundCreate"}
+	};
+
+	for (int n = 0; n < ARRAY_LEN (to_check); n++) {
+		void ** slot = find_import_slot (ad->sound_module, to_check[n].dll, to_check[n].func);
+		snprintf (ss, sizeof ss, "C3X audio: sound.dll imports %s!%s: %s\n",
+			  to_check[n].dll, to_check[n].func, (slot != NULL) ? "yes" : "no");
+		ss[(sizeof ss) - 1] = '\0';
+		(*p_OutputDebugStringA) (ss);
+	}
+}
+
+// True if the path or module name refers to sound.dll. The game may pass a full path, so match the file name at the end.
+bool
+names_sound_dll (char const * name)
+{
+	if (name == NULL)
+		return false;
+
+	char const * file_name = name;
+	for (char const * c = name; *c != '\0'; c++)
+		if ((*c == '\\') || (*c == '/'))
+			file_name = c + 1;
+
+	return _stricmp (file_name, "sound.dll") == 0;
+}
+
+HMODULE WINAPI
+patch_audio_diag_LoadLibraryA (char const * file_name)
+{
+	HMODULE result = is->audio_diagnostics.orig_load_library (file_name);
+
+	if (names_sound_dll (file_name)) {
+		is->audio_diagnostics.sound_module = result;
+		if (should_log_audio_diag (ADK_LOAD_LIBRARY)) {
+			char ss[300];
+			snprintf (ss, sizeof ss, "C3X audio: game loaded \"%s\" -> module 0x%p\n", file_name, result);
+			ss[(sizeof ss) - 1] = '\0';
+			(*p_OutputDebugStringA) (ss);
+		}
+		report_sound_dll_imports ();
+	}
+
+	return result;
+}
+
+FARPROC WINAPI
+patch_audio_diag_GetProcAddress (HMODULE module, char const * proc_name)
+{
+	// Must call the saved original rather than going through p_GetProcAddress, which now points here and would recurse forever.
+	FARPROC result = is->audio_diagnostics.orig_get_proc_address (module, proc_name);
+
+	// Only interested in sound.dll. Everything else goes straight through.
+	if ((module == NULL) || (module != is->audio_diagnostics.sound_module))
+		return result;
+
+	report_sound_dll_imports (); // no-op unless it hasn't been done yet, which is the case if logging got turned on after sound.dll loaded
+
+	if (should_log_audio_diag (ADK_GET_PROC_ADDRESS)) {
+		char ss[300];
+		// Exports can be requested by ordinal instead of by name, in which case the "name" is a small integer rather than a pointer. That's
+		// how Civ 3 asks for the wave and midi device constructors, whose real names are C++ mangled.
+		if (((unsigned)proc_name & 0xFFFF0000) == 0)
+			snprintf (ss, sizeof ss, "C3X audio: game resolved sound.dll ordinal %u -> 0x%p\n", (unsigned)proc_name, result);
+		else
+			snprintf (ss, sizeof ss, "C3X audio: game resolved sound.dll \"%s\" -> 0x%p\n", proc_name, result);
+		ss[(sizeof ss) - 1] = '\0';
+		(*p_OutputDebugStringA) (ss);
+	}
+
+	return result;
+}
+
+// Installs all of the diagnostic hooks. Called from patch_init_floating_point, which runs at the end of CRT initialization, before the game's global
+// constructors and long before it sets up its sound timers or loads sound.dll.
+//
+// The hooks go in whether or not log_audio_diagnostics is set, because the config files haven't been read at this point and the calls worth seeing
+// happen during startup. They're pass-throughs that check the setting before logging anything, so leaving them installed costs a branch per call and
+// lets the option be turned on without restarting the game.
+void
+set_up_audio_diagnostics ()
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+
+	*ad = (struct audio_diagnostics) {0};
+
+	struct { char const * name; void * replacement; void ** p_original; } const winmm_hooks[] = {
+		{"timeGetDevCaps" , patch_timeGetDevCaps , (void **)&ad->timeGetDevCaps },
+		{"timeBeginPeriod", patch_timeBeginPeriod, (void **)&ad->timeBeginPeriod},
+		{"timeEndPeriod"  , patch_timeEndPeriod  , (void **)&ad->timeEndPeriod  },
+		{"timeSetEvent"   , patch_timeSetEvent   , (void **)&ad->timeSetEvent   },
+		{"timeKillEvent"  , patch_timeKillEvent  , (void **)&ad->timeKillEvent  }
+	};
+
+	// Throughout, the original is recorded before the slot is redirected, never after, so a hook can never run without knowing what to call
+	// through to.
+	for (int n = 0; n < ARRAY_LEN (winmm_hooks); n++) {
+		void ** slot = find_import_slot (NULL, "winmm.dll", winmm_hooks[n].name);
+		if (slot != NULL) {
+			*winmm_hooks[n].p_original = *slot;
+			replace_import (slot, winmm_hooks[n].replacement);
+		}
+	}
+
+	// Watch the game load sound.dll and resolve its exports. sound.dll isn't statically imported so this is the only way to see it happen.
+	void ** load_library_slot = find_import_slot (NULL, "kernel32.dll", "LoadLibraryA");
+	if (load_library_slot != NULL) {
+		ad->orig_load_library = (void *)*load_library_slot;
+		replace_import (load_library_slot, patch_audio_diag_LoadLibraryA);
+	}
+
+	// p_GetProcAddress points at this same slot, so from here on the mod's own lookups go through the hook too. That's harmless, and the mod has
+	// already finished resolving everything it needs by this point.
+	ad->orig_get_proc_address = (void *)*(void **)p_GetProcAddress;
+	replace_import ((void **)p_GetProcAddress, patch_audio_diag_GetProcAddress);
+
+	// In case sound.dll was already loaded before we got here.
+	if (ad->sound_module == NULL)
+		ad->sound_module = (*p_GetModuleHandleA) ("sound.dll");
 }
 
 bool
