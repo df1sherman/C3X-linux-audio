@@ -20342,7 +20342,6 @@ patch_init_floating_point ()
 		int offset;
 	} integer_config_options[] = {
 		{"limit_railroad_movement"                           ,     0,  offsetof (struct c3x_config, limit_railroad_movement)},
-		{"stuck_sound_timeout"                               ,    10,  offsetof (struct c3x_config, stuck_sound_timeout)},
 		{"minimum_city_separation"                           ,     1,  offsetof (struct c3x_config, minimum_city_separation)},
 		{"anarchy_length_percent"                            ,   100,  offsetof (struct c3x_config, anarchy_length_percent)},
 		{"steal_plans_duration"                              ,     1,  offsetof (struct c3x_config, steal_plans_duration)},
@@ -34734,13 +34733,16 @@ stop_overrunning_sounds ()
 		if ((tracked->core == NULL) || ! tracked->playing)
 			continue;
 
-		// Wait the sound's own length where we have one, plus a margin so a sound that is merely finishing is never cut off. Where M50 gave
-		// nothing usable, fall back on the configured timeout, which is far longer than any sound effect in the game.
-		double allowed = (tracked->reported_length_ms > 0)
-			? ((double)tracked->reported_length_ms / 1000.0) + 1.0
-			: (double)is->current_config.stuck_sound_timeout;
-		if (allowed <= 0.0)
+		// Only ever act on a sound whose length we actually know. Streaming music reports no length, and an earlier version treated that as
+		// "use a timeout instead", which silenced the soundtrack ten seconds into every game. Absence of a length is not evidence that a
+		// sound has overrun, it is the one case where we have no idea, so leave it alone. Sounds with no filename are skipped for the same
+		// reason: they are the engine's own internal objects rather than anything the game started and forgot.
+		if ((tracked->reported_length_ms <= 0) || (tracked->path[0] == '\0'))
 			continue;
+
+		// The margin only guards against the reported length being a touch short of the real one. It used to be a full second, which let a
+		// repeating sound get a second of its repeat out before being cut; a quarter of a second is still ample and far less audible.
+		double allowed = ((double)tracked->reported_length_ms / 1000.0) + 0.25;
 
 		double elapsed = (double)(now.QuadPart - tracked->started_at.QuadPart) / (double)perf_freq.QuadPart;
 		if (elapsed < allowed)

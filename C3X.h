@@ -407,7 +407,6 @@ struct c3x_config {
 	bool disallow_useless_bombard_vs_airfields;
 	bool log_audio_diagnostics;
 	enum wine_workaround_mode stop_stuck_sounds;
-	int stuck_sound_timeout;
 	enum wine_workaround_mode draw_lines_using_gdi_plus;
 	bool compact_luxury_display_on_city_screen;
 	bool compact_strategic_resource_display_on_city_screen;
