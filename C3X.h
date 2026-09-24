@@ -407,6 +407,7 @@ struct c3x_config {
 	bool disallow_useless_bombard_vs_airfields;
 	bool log_audio_diagnostics;
 	enum wine_workaround_mode stop_stuck_sounds;
+	int stuck_sound_margin;
 	enum wine_workaround_mode draw_lines_using_gdi_plus;
 	bool compact_luxury_display_on_city_screen;
 	bool compact_strategic_resource_display_on_city_screen;
@@ -2379,6 +2380,10 @@ struct injected_state {
 		unsigned (WINAPI * timeEndPeriod) (unsigned);
 		unsigned (WINAPI * timeSetEvent) (unsigned, unsigned, void *, unsigned, unsigned);
 		unsigned (WINAPI * timeKillEvent) (unsigned);
+
+		// sound.dll's own periodic timer callback. Wrapped so the watchdog can run from it: it fires every 30 ms on the multimedia timer's own
+		// thread, so unlike anything driven by the game's message loop it keeps running while a popup or an animation has the main thread.
+		void (WINAPI * orig_timer_callback) (unsigned, unsigned, unsigned, unsigned, unsigned);
 		// Named differently from the Win32 functions they hold because injected_code.c #defines LoadLibraryA to an is-> lookup, which would
 		// otherwise rewrite the field name out from under us.
 		FARPROC (WINAPI * orig_get_proc_address) (HMODULE, char const *);

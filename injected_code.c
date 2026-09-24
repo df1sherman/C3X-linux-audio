@@ -20342,6 +20342,7 @@ patch_init_floating_point ()
 		int offset;
 	} integer_config_options[] = {
 		{"limit_railroad_movement"                           ,     0,  offsetof (struct c3x_config, limit_railroad_movement)},
+		{"stuck_sound_margin"                                ,    30,  offsetof (struct c3x_config, stuck_sound_margin)},
 		{"minimum_city_separation"                           ,     1,  offsetof (struct c3x_config, minimum_city_separation)},
 		{"anarchy_length_percent"                            ,   100,  offsetof (struct c3x_config, anarchy_length_percent)},
 		{"steal_plans_duration"                              ,     1,  offsetof (struct c3x_config, steal_plans_duration)},
@@ -34367,10 +34368,31 @@ patch_timeEndPeriod (unsigned period)
 	return result;
 }
 
+// Runs on the multimedia timer's own thread every 30 ms, whatever the game's main thread is doing. The watchdog needs that: the tick it had been
+// using stalls while a popup or an animation holds the main thread, and the log showed overshoots of up to seven seconds because of it, which is
+// why the palace fanfare was still heard to repeat.
+void WINAPI
+patch_sound_timer_callback (unsigned timer_id, unsigned msg, unsigned user_data, unsigned dw1, unsigned dw2)
+{
+	// Let sound.dll service its audio first, so anything we stop is stopped from a point the engine has just finished working from.
+	if (is->audio_diagnostics.orig_timer_callback != NULL)
+		is->audio_diagnostics.orig_timer_callback (timer_id, msg, user_data, dw1, dw2);
+
+	stop_overrunning_sounds ();
+}
+
 unsigned WINAPI
 patch_timeSetEvent (unsigned delay, unsigned resolution, void * callback, unsigned user_data, unsigned flags)
 {
-	unsigned timer_id = is->audio_diagnostics.timeSetEvent (delay, resolution, callback, user_data, flags);
+	// Substitute our own callback so the watchdog gets a tick that the main thread cannot stall. Only for the first function-style timer: bits
+	// 0x30 of the flags pick the callback style, and anything other than zero there means the "callback" is an event handle, not a function.
+	void * callback_to_use = callback;
+	if ((callback != NULL) && ((flags & 0x30) == 0) && (is->audio_diagnostics.orig_timer_callback == NULL)) {
+		is->audio_diagnostics.orig_timer_callback = (void *)callback;
+		callback_to_use = patch_sound_timer_callback;
+	}
+
+	unsigned timer_id = is->audio_diagnostics.timeSetEvent (delay, resolution, callback_to_use, user_data, flags);
 
 	// Low bit of the flags picks the callback style, and bit 1 is set for a periodic timer as opposed to a one shot. What we want to see is the
 	// delay and resolution the game asks for, and whether the timer was created at all (an ID of zero means it wasn't).
@@ -34740,9 +34762,10 @@ stop_overrunning_sounds ()
 		if ((tracked->reported_length_ms <= 0) || (tracked->path[0] == '\0'))
 			continue;
 
-		// The margin only guards against the reported length being a touch short of the real one. It used to be a full second, which let a
-		// repeating sound get a second of its repeat out before being cut; a quarter of a second is still ample and far less audible.
-		double allowed = ((double)tracked->reported_length_ms / 1000.0) + 0.25;
+		// Whatever margin is allowed past the reported length is time the repeat is audible, because a sound that has overrun is by then
+		// playing its own start again. A quarter second of that is enough to hear as a chopped-off repeat, so the default is small and the
+		// setting exists to trade a clipped tail against an audible repeat either way.
+		double allowed = ((double)tracked->reported_length_ms + (double)is->current_config.stuck_sound_margin) / 1000.0;
 
 		double elapsed = (double)(now.QuadPart - tracked->started_at.QuadPart) / (double)perf_freq.QuadPart;
 		if (elapsed < allowed)
