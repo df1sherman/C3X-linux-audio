@@ -20120,6 +20120,7 @@ patch_Map_Renderer_load_images (Map_Renderer *this, int edx)
 }
 
 void set_up_audio_diagnostics (); // defined down with the rest of the audio diagnostics
+void flush_audio_diagnostics ();  // likewise
 
 void
 patch_init_floating_point ()
@@ -24238,6 +24239,10 @@ patch_load_scenario (BIC * this, int edx, char * param_1, unsigned * param_2)
 	}
 	load_config ("custom.c3x_config.ini", 1);
 	apply_machine_code_edits (&is->current_config, false);
+
+	// Now that the settings are known, print or discard whatever the audio diagnostics recorded while the game was starting up. The game
+	// sets up its sound timers and loads sound.dll well before this point, so those events are only visible through the buffer.
+	flush_audio_diagnostics ();
 
 	if (is->current_config.enable_districts || is->current_config.enable_natural_wonders) {
 		reset_district_state (true);
@@ -34169,17 +34174,66 @@ patch_Trade_Net_set_unit_path_to_fill_road_net (Trade_Net * this, int edx, int f
 // than through find_import_slot.
 //
 
-// Returns true if this kind of event should still be logged. Each kind goes quiet after MAX_AUDIO_DIAG_LOGS so that a function the game calls
+// Returns true if this kind of event should still be recorded. Each kind goes quiet after MAX_AUDIO_DIAG_LOGS so that a function the game calls
 // constantly can't bury everything else.
 bool
 should_log_audio_diag (enum audio_diag_kind kind)
 {
-	if (! is->current_config.log_audio_diagnostics)
+	// Before the config has been read there's no way to know whether the player wants diagnostics, so record the event regardless and let
+	// flush_audio_diagnostics decide later. Everything the game does to set up its audio happens in that window.
+	if (is->audio_diagnostics.config_has_been_read && ! is->current_config.log_audio_diagnostics)
 		return false;
 	if (is->audio_diagnostics.log_counts[kind] >= MAX_AUDIO_DIAG_LOGS)
 		return false;
 	is->audio_diagnostics.log_counts[kind] += 1;
 	return true;
+}
+
+// Writes out one diagnostic line, or stashes it if we don't yet know whether the player wants it.
+void
+put_audio_diag (char const * line)
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+
+	if (ad->config_has_been_read) {
+		if (is->current_config.log_audio_diagnostics)
+			(*p_OutputDebugStringA) ((char *)line);
+	} else if (ad->buffered_line_count < AUDIO_DIAG_BUFFER_LINES) {
+		char * slot = ad->buffered_lines[ad->buffered_line_count];
+		strncpy (slot, line, AUDIO_DIAG_LINE_LEN - 1);
+		slot[AUDIO_DIAG_LINE_LEN - 1] = '\0';
+		ad->buffered_line_count += 1;
+	} else
+		ad->dropped_line_count += 1;
+}
+
+// Called once the config files have been read, from patch_load_scenario. Prints everything recorded during startup, or discards it if the player
+// didn't ask for diagnostics. Only does anything the first time.
+void
+flush_audio_diagnostics ()
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+	char ss[300];
+
+	if (ad->config_has_been_read)
+		return;
+	ad->config_has_been_read = true;
+
+	if (is->current_config.log_audio_diagnostics) {
+		(*p_OutputDebugStringA) ("C3X audio: ---- recorded during startup, before the config was read ----\n");
+		for (int n = 0; n < ad->buffered_line_count; n++)
+			(*p_OutputDebugStringA) (ad->buffered_lines[n]);
+		if (ad->dropped_line_count > 0) {
+			snprintf (ss, sizeof ss, "C3X audio: (%d more startup lines didn't fit in the buffer)\n", ad->dropped_line_count);
+			ss[(sizeof ss) - 1] = '\0';
+			(*p_OutputDebugStringA) (ss);
+		}
+		(*p_OutputDebugStringA) ("C3X audio: ---- end of startup diagnostics, anything after this is live ----\n");
+	}
+
+	// The buffer has done its job either way, so let it go.
+	ad->buffered_line_count = 0;
+	ad->dropped_line_count = 0;
 }
 
 // Finds the import address table slot "module" uses to call a function from another DLL, or NULL if it doesn't import it. Pass NULL for the module
@@ -34257,7 +34311,7 @@ patch_timeGetDevCaps (C3X_TIMECAPS * caps, unsigned size)
 		else
 			snprintf (ss, sizeof ss, "C3X audio: timeGetDevCaps failed, returned %u\n", result);
 		ss[(sizeof ss) - 1] = '\0';
-		(*p_OutputDebugStringA) (ss);
+		put_audio_diag (ss);
 	}
 
 	return result;
@@ -34272,7 +34326,7 @@ patch_timeBeginPeriod (unsigned period)
 		char ss[300];
 		snprintf (ss, sizeof ss, "C3X audio: timeBeginPeriod(%u ms) returned %u (0 means it was granted)\n", period, result);
 		ss[(sizeof ss) - 1] = '\0';
-		(*p_OutputDebugStringA) (ss);
+		put_audio_diag (ss);
 	}
 
 	return result;
@@ -34287,7 +34341,7 @@ patch_timeEndPeriod (unsigned period)
 		char ss[300];
 		snprintf (ss, sizeof ss, "C3X audio: timeEndPeriod(%u ms) returned %u\n", period, result);
 		ss[(sizeof ss) - 1] = '\0';
-		(*p_OutputDebugStringA) (ss);
+		put_audio_diag (ss);
 	}
 
 	return result;
@@ -34305,7 +34359,7 @@ patch_timeSetEvent (unsigned delay, unsigned resolution, void * callback, unsign
 		snprintf (ss, sizeof ss, "C3X audio: timeSetEvent(delay %u ms, resolution %u ms, flags 0x%x) -> timer %u%s\n",
 			  delay, resolution, flags, timer_id, (timer_id == 0) ? " (FAILED)" : "");
 		ss[(sizeof ss) - 1] = '\0';
-		(*p_OutputDebugStringA) (ss);
+		put_audio_diag (ss);
 	}
 
 	return timer_id;
@@ -34320,7 +34374,7 @@ patch_timeKillEvent (unsigned timer_id)
 		char ss[300];
 		snprintf (ss, sizeof ss, "C3X audio: timeKillEvent(timer %u) returned %u\n", timer_id, result);
 		ss[(sizeof ss) - 1] = '\0';
-		(*p_OutputDebugStringA) (ss);
+		put_audio_diag (ss);
 	}
 
 	return result;
@@ -34340,7 +34394,9 @@ report_sound_dll_imports ()
 	struct audio_diagnostics * ad = &is->audio_diagnostics;
 	char ss[300];
 
-	if (ad->reported_sound_imports || (ad->sound_module == NULL) || ! is->current_config.log_audio_diagnostics)
+	// Deliberately not gated on the setting here. This runs while sound.dll is being loaded, which is before the config has been read, so the
+	// report goes into the buffer and flush_audio_diagnostics decides whether it ever gets printed.
+	if (ad->reported_sound_imports || (ad->sound_module == NULL))
 		return;
 	ad->reported_sound_imports = true;
 
@@ -34358,7 +34414,7 @@ report_sound_dll_imports ()
 		snprintf (ss, sizeof ss, "C3X audio: sound.dll imports %s!%s: %s\n",
 			  to_check[n].dll, to_check[n].func, (slot != NULL) ? "yes" : "no");
 		ss[(sizeof ss) - 1] = '\0';
-		(*p_OutputDebugStringA) (ss);
+		put_audio_diag (ss);
 	}
 }
 
@@ -34388,7 +34444,7 @@ patch_audio_diag_LoadLibraryA (char const * file_name)
 			char ss[300];
 			snprintf (ss, sizeof ss, "C3X audio: game loaded \"%s\" -> module 0x%p\n", file_name, result);
 			ss[(sizeof ss) - 1] = '\0';
-			(*p_OutputDebugStringA) (ss);
+			put_audio_diag (ss);
 		}
 		report_sound_dll_imports ();
 	}
@@ -34417,7 +34473,7 @@ patch_audio_diag_GetProcAddress (HMODULE module, char const * proc_name)
 		else
 			snprintf (ss, sizeof ss, "C3X audio: game resolved sound.dll \"%s\" -> 0x%p\n", proc_name, result);
 		ss[(sizeof ss) - 1] = '\0';
-		(*p_OutputDebugStringA) (ss);
+		put_audio_diag (ss);
 	}
 
 	return result;
@@ -34434,7 +34490,22 @@ set_up_audio_diagnostics ()
 {
 	struct audio_diagnostics * ad = &is->audio_diagnostics;
 
-	*ad = (struct audio_diagnostics) {0};
+	// Zero the scalars individually rather than assigning a compound literal. The line buffer makes this struct large enough that doing it in one
+	// go could put a sizable temporary on the stack, and the buffer itself doesn't need clearing since buffered_line_count governs what's read.
+	ad->timeGetDevCaps = NULL;
+	ad->timeBeginPeriod = NULL;
+	ad->timeEndPeriod = NULL;
+	ad->timeSetEvent = NULL;
+	ad->timeKillEvent = NULL;
+	ad->orig_get_proc_address = NULL;
+	ad->orig_load_library = NULL;
+	ad->sound_module = NULL;
+	ad->reported_sound_imports = false;
+	ad->config_has_been_read = false;
+	ad->buffered_line_count = 0;
+	ad->dropped_line_count = 0;
+	for (int n = 0; n < COUNT_ADK; n++)
+		ad->log_counts[n] = 0;
 
 	struct { char const * name; void * replacement; void ** p_original; } const winmm_hooks[] = {
 		{"timeGetDevCaps" , patch_timeGetDevCaps , (void **)&ad->timeGetDevCaps },
