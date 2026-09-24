@@ -45440,7 +45440,11 @@ clear_active_custom_tile_animation_effects ()
 void __stdcall
 patch_on_timer_0x9F6500 (void)
 {
-	stop_overrunning_sounds ();
+	// The watchdog is normally ticked from the multimedia timer's own thread instead of from here, because this tick stalls for as long as a
+	// popup or an animation holds the main thread. Keep it only as a fallback for the case where that substitution never happened, so the
+	// watchdog still gets some tick rather than none.
+	if (is->audio_diagnostics.orig_timer_callback == NULL)
+		stop_overrunning_sounds ();
 
 	if (is->current_config.enable_custom_animations) {
 		if ((*p_debug_mode_bits & 0xC) != 0)
