@@ -117,10 +117,12 @@ enum retreat_rules {
 	RR_IF_FAST_AND_NOT_SLOWER,
 };
 
-enum line_drawing_override {
-	LDO_NEVER = 0,
-	LDO_WINE,
-	LDO_ALWAYS
+// Shared by the options that work around bugs which only appear on Wine, including Proton. "wine" means apply it only when we detect we are
+// running there, which is what these normally want.
+enum wine_workaround_mode {
+	WWM_NEVER = 0,
+	WWM_WINE,
+	WWM_ALWAYS
 };
 
 enum minimap_doubling_mode {
@@ -404,7 +406,9 @@ struct c3x_config {
 	bool show_untradable_techs_on_trade_screen;
 	bool disallow_useless_bombard_vs_airfields;
 	bool log_audio_diagnostics;
-	enum line_drawing_override draw_lines_using_gdi_plus;
+	enum wine_workaround_mode stop_stuck_sounds;
+	int stuck_sound_timeout;
+	enum wine_workaround_mode draw_lines_using_gdi_plus;
 	bool compact_luxury_display_on_city_screen;
 	bool compact_strategic_resource_display_on_city_screen;
 	bool warn_when_chosen_building_would_replace_another;
@@ -721,7 +725,11 @@ typedef struct {
 	void * omitted[7];
 	int (__fastcall * Play) (Sound_Core * this, int edx); // slot 7
 	int (__fastcall * Stop) (Sound_Core * this, int edx); // slot 8
-	void * omitted_2[68];
+	void * omitted_2[41];
+	// A getter that does no work. The Sound Test harness saw it return 1496 from inside the game, which is the right order of
+	// magnitude for a short sound effect's length in milliseconds. Logged so that guess can be checked against real files.
+	int (__fastcall * M50) (Sound_Core * this, int edx); // slot 50
+	void * omitted_3[26];
 } Sound_Core_vtable;
 
 struct Sound_Core {
@@ -2396,6 +2404,9 @@ struct injected_state {
 		struct tracked_sound {
 			Sound_Core * core;
 			char path[SOUND_PATH_LEN];
+			bool playing;
+			LARGE_INTEGER started_at; // only meaningful while playing is set
+			int reported_length_ms;  // what M50 gave us at play time, or zero if it looked implausible
 		} tracked_sounds[MAX_TRACKED_SOUNDS];
 
 		// sound.dll's own CoCreateInstance, hooked so we can see which COM classes it asks for and whether it gets them.

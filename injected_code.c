@@ -2413,12 +2413,12 @@ read_retreat_rules (struct string_slice const * s, int * out_val)
 }
 
 bool
-read_line_drawing_override (struct string_slice const * s, int * out_val)
+read_wine_workaround_mode (struct string_slice const * s, int * out_val)
 {
 	struct string_slice trimmed = trim_string_slice (s, 1);
-	if      (slice_matches_str (&trimmed, "never" )) { *out_val = LDO_NEVER;  return true; }
-	else if (slice_matches_str (&trimmed, "wine"  )) { *out_val = LDO_WINE;   return true; }
-	else if (slice_matches_str (&trimmed, "always")) { *out_val = LDO_ALWAYS; return true; }
+	if      (slice_matches_str (&trimmed, "never" )) { *out_val = WWM_NEVER;  return true; }
+	else if (slice_matches_str (&trimmed, "wine"  )) { *out_val = WWM_WINE;   return true; }
+	else if (slice_matches_str (&trimmed, "always")) { *out_val = WWM_ALWAYS; return true; }
 	else
 		return false;
 }
@@ -3259,8 +3259,11 @@ load_config (char const * file_path, int path_is_relative_to_mod_dir)
 				} else if (slice_matches_str (&p.key, "pollution_spawn_effect")) {
 					if (! read_pollution_spawn_effect (&value, (int *)&cfg->pollution_spawn_effect))
 						handle_config_error (&p, CPE_BAD_VALUE);
+				} else if (slice_matches_str (&p.key, "stop_stuck_sounds")) {
+					if (! read_wine_workaround_mode (&value, (int *)&cfg->stop_stuck_sounds))
+						handle_config_error (&p, CPE_BAD_VALUE);
 				} else if (slice_matches_str (&p.key, "draw_lines_using_gdi_plus")) {
-					if (! read_line_drawing_override (&value, (int *)&cfg->draw_lines_using_gdi_plus))
+					if (! read_wine_workaround_mode (&value, (int *)&cfg->draw_lines_using_gdi_plus))
 						handle_config_error (&p, CPE_BAD_VALUE);
 				} else if (slice_matches_str (&p.key, "double_minimap_size")) {
 					if (! read_minimap_doubling_mode (&value, (int *)&cfg->double_minimap_size))
@@ -20120,6 +20123,7 @@ patch_Map_Renderer_load_images (Map_Renderer *this, int edx)
 }
 
 void set_up_audio_diagnostics (); // defined down with the rest of the audio diagnostics
+void stop_overrunning_sounds ();  // likewise
 void flush_audio_diagnostics ();  // likewise
 
 void
@@ -20338,6 +20342,7 @@ patch_init_floating_point ()
 		int offset;
 	} integer_config_options[] = {
 		{"limit_railroad_movement"                           ,     0,  offsetof (struct c3x_config, limit_railroad_movement)},
+		{"stuck_sound_timeout"                               ,    10,  offsetof (struct c3x_config, stuck_sound_timeout)},
 		{"minimum_city_separation"                           ,     1,  offsetof (struct c3x_config, minimum_city_separation)},
 		{"anarchy_length_percent"                            ,   100,  offsetof (struct c3x_config, anarchy_length_percent)},
 		{"steal_plans_duration"                              ,     1,  offsetof (struct c3x_config, steal_plans_duration)},
@@ -20450,7 +20455,8 @@ patch_init_floating_point ()
 	base_config.sea_retreat_rules  = RR_STANDARD;
 	base_config.ai_settler_perfume_on_founding = 0;
 	base_config.work_area_limit = WAL_NONE;
-	base_config.draw_lines_using_gdi_plus = LDO_WINE;
+	base_config.draw_lines_using_gdi_plus = WWM_WINE;
+	base_config.stop_stuck_sounds = WWM_WINE;
 	base_config.double_minimap_size = MDM_HIGH_DEF;
 	base_config.combat_win_rate_display_mode = CWRDM_DETAILED;
 	base_config.override_no_ai_patrol = NAPO_NONE;
@@ -34509,7 +34515,22 @@ remember_sound_path (Sound_Core * core, char const * file_path)
 		slot->path[SOUND_PATH_LEN - 1] = '\0';
 	} else
 		slot->path[0] = '\0';
+	slot->playing = false;
+	slot->reported_length_ms = 0;
 	return true;
+}
+
+// The tracking entry for a sound object, or NULL if it isn't one we saw created.
+struct tracked_sound *
+find_tracked_sound (Sound_Core * core)
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+	if (core == NULL)
+		return NULL;
+	for (int n = 0; n < MAX_TRACKED_SOUNDS; n++)
+		if (ad->tracked_sounds[n].core == core)
+			return &ad->tracked_sounds[n];
+	return NULL;
 }
 
 // The file a sound object was made from, or a placeholder if it isn't one we saw created.
@@ -34531,6 +34552,7 @@ forget_sound_path (Sound_Core * core)
 		if (ad->tracked_sounds[n].core == core) {
 			ad->tracked_sounds[n].core = NULL;
 			ad->tracked_sounds[n].path[0] = '\0';
+			ad->tracked_sounds[n].playing = false;
 			return;
 		}
 }
@@ -34551,9 +34573,26 @@ patch_sound_core_play (Sound_Core * this, int edx)
 {
 	struct hooked_sound_vtable * hooked = ((this != NULL) && (this->vtable != NULL)) ? find_hooked_sound_vtable (this->vtable) : NULL;
 
+	// Ask the sound how long it is before starting it. M50 is a getter that does no work; if it really is a length in milliseconds then the
+	// watchdog can wait exactly as long as the sound needs instead of falling back on a blanket timeout. Anything outside a sane range is
+	// treated as "not a length" so a wrong guess can't cut sounds short.
+	int length_ms = 0;
+	if ((this != NULL) && (this->vtable != NULL) && (this->vtable->M50 != NULL)) {
+		int reported = this->vtable->M50 (this, __);
+		if ((reported > 0) && (reported <= 10 * 60 * 1000))
+			length_ms = reported;
+	}
+
+	struct tracked_sound * tracked = find_tracked_sound (this);
+	if (tracked != NULL) {
+		tracked->playing = true;
+		tracked->reported_length_ms = length_ms;
+		QueryPerformanceCounter (&tracked->started_at);
+	}
+
 	if (should_log_audio_diag (ADK_SOUND_PLAY)) {
 		char ss[300];
-		snprintf (ss, sizeof ss, "C3X audio: PLAY  \"%s\" (sound 0x%p)\n", sound_path (this), (void *)this);
+		snprintf (ss, sizeof ss, "C3X audio: PLAY  \"%s\" (sound 0x%p) M50 says %d ms\n", sound_path (this), (void *)this, length_ms);
 		ss[(sizeof ss) - 1] = '\0';
 		put_audio_diag (ss);
 	}
@@ -34577,6 +34616,10 @@ patch_sound_core_stop (Sound_Core * this, int edx)
 	}
 
 	int result = hooked->Stop (this, __);
+
+	struct tracked_sound * tracked = find_tracked_sound (this);
+	if (tracked != NULL)
+		tracked->playing = false;
 
 	// Logged after the call so the return value is in the line. A non-zero return is sound.dll refusing the stop, which is the difference
 	// between a sound nobody asked to stop and one that would not.
@@ -34665,6 +34708,59 @@ patch_delete_sound (Sound_Core * sound_core)
 
 	forget_sound_path (sound_core);
 	return is->audio_diagnostics.orig_delete_sound (sound_core);
+}
+
+//
+// The fix. The game fires one-shot sounds and leaves them to finish on their own, and on Wine they never do: LoveTheKing.wav is played once, Stop is
+// never called on it, and it runs until the process exits. Stopping works perfectly well when the game does ask, so the mod asks on its behalf once
+// a sound has outstayed its length.
+//
+
+void
+stop_overrunning_sounds ()
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+
+	if ((is->current_config.stop_stuck_sounds == WWM_NEVER) ||
+	    ((is->current_config.stop_stuck_sounds == WWM_WINE) && ! is->running_on_wine))
+		return;
+
+	LARGE_INTEGER perf_freq, now;
+	if ((! QueryPerformanceFrequency (&perf_freq)) || (perf_freq.QuadPart <= 0) || (! QueryPerformanceCounter (&now)))
+		return;
+
+	for (int n = 0; n < MAX_TRACKED_SOUNDS; n++) {
+		struct tracked_sound * tracked = &ad->tracked_sounds[n];
+		if ((tracked->core == NULL) || ! tracked->playing)
+			continue;
+
+		// Wait the sound's own length where we have one, plus a margin so a sound that is merely finishing is never cut off. Where M50 gave
+		// nothing usable, fall back on the configured timeout, which is far longer than any sound effect in the game.
+		double allowed = (tracked->reported_length_ms > 0)
+			? ((double)tracked->reported_length_ms / 1000.0) + 1.0
+			: (double)is->current_config.stuck_sound_timeout;
+		if (allowed <= 0.0)
+			continue;
+
+		double elapsed = (double)(now.QuadPart - tracked->started_at.QuadPart) / (double)perf_freq.QuadPart;
+		if (elapsed < allowed)
+			continue;
+
+		struct hooked_sound_vtable * hooked = (tracked->core->vtable != NULL) ? find_hooked_sound_vtable (tracked->core->vtable) : NULL;
+
+		// Clear the flag first, so a sound we turn out not to be able to silence doesn't get a stop attempt on every single tick.
+		tracked->playing = false;
+		if (hooked == NULL)
+			continue;
+
+		int result = hooked->Stop (tracked->core, __);
+
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: stopped overrunning \"%s\" after %d ms (expected %d ms), stop returned %d\n",
+			  tracked->path, (int)(elapsed * 1000.0), tracked->reported_length_ms, result);
+		ss[(sizeof ss) - 1] = '\0';
+		put_audio_diag (ss);
+	}
 }
 
 // True if the path or module name refers to sound.dll. The game may pass a full path, so match the file name at the end.
@@ -34864,6 +34960,7 @@ set_up_audio_diagnostics ()
 	for (int n = 0; n < MAX_TRACKED_SOUNDS; n++) {
 		ad->tracked_sounds[n].core = NULL;
 		ad->tracked_sounds[n].path[0] = '\0';
+		ad->tracked_sounds[n].playing = false;
 	}
 
 	int timer_hooks_total = 0;
@@ -34956,8 +35053,8 @@ set_up_gdi_plus ()
 int __fastcall
 patch_OpenGLRenderer_initialize (OpenGLRenderer * this, int edx, PCX_Image * texture)
 {
-	if ((is->current_config.draw_lines_using_gdi_plus == LDO_NEVER) ||
-	    ((is->current_config.draw_lines_using_gdi_plus == LDO_WINE) && ! is->running_on_wine))
+	if ((is->current_config.draw_lines_using_gdi_plus == WWM_NEVER) ||
+	    ((is->current_config.draw_lines_using_gdi_plus == WWM_WINE) && ! is->running_on_wine))
 		return OpenGLRenderer_initialize (this, __, texture);
 
 	// Initialize GDI+ instead
@@ -35026,8 +35123,8 @@ patch_OpenGLRenderer_disable_line_dashing (OpenGLRenderer * this)
 void __fastcall
 patch_OpenGLRenderer_draw_line (OpenGLRenderer * this, int edx, int x1, int y1, int x2, int y2)
 {
-	if ((is->current_config.draw_lines_using_gdi_plus == LDO_NEVER) ||
-	    ((is->current_config.draw_lines_using_gdi_plus == LDO_WINE) && ! is->running_on_wine))
+	if ((is->current_config.draw_lines_using_gdi_plus == WWM_NEVER) ||
+	    ((is->current_config.draw_lines_using_gdi_plus == WWM_WINE) && ! is->running_on_wine))
 		OpenGLRenderer_draw_line (this, __, x1, y1, x2, y2);
 
 	else if ((is->gdi_plus.init_state == IS_OK) && (is->gdi_plus.gp_graphics != NULL)) {
@@ -45318,6 +45415,8 @@ clear_active_custom_tile_animation_effects ()
 void __stdcall
 patch_on_timer_0x9F6500 (void)
 {
+	stop_overrunning_sounds ();
+
 	if (is->current_config.enable_custom_animations) {
 		if ((*p_debug_mode_bits & 0xC) != 0)
 			clear_active_custom_tile_animation_effects ();
