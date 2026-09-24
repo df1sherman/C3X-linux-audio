@@ -711,6 +711,27 @@ typedef struct {
 	unsigned wPeriodMax;
 } C3X_TIMECAPS;
 
+// sound.dll's sound object, and the two entry points that create and destroy one. The export table names create_sound at ordinal 1 and
+// delete_sound at ordinal 2, and both signatures are the ones the Sound Test harness and the AMB Editor already drive successfully. Play sits at
+// vtable slot 7 and Stop at slot 8, which is the layout the AMB Editor's preview code uses to start and stop sounds. Everything else is padding so
+// those two slot numbers stay right.
+typedef struct Sound_Core Sound_Core;
+
+typedef struct {
+	void * omitted[7];
+	int (__fastcall * Play) (Sound_Core * this, int edx); // slot 7
+	int (__fastcall * Stop) (Sound_Core * this, int edx); // slot 8
+	void * omitted_2[68];
+} Sound_Core_vtable;
+
+struct Sound_Core {
+	Sound_Core_vtable * vtable;
+	// many more fields omitted
+};
+
+// Sound objects of the same kind share a vtable, so there are only ever a handful.
+#define MAX_HOOKED_SOUND_VTABLES 8
+
 // The audio diagnostics hook one function each. Used to index audio_diagnostics.log_counts so that one chatty function can't flood the log.
 enum audio_diag_kind {
 	ADK_TIME_GET_DEV_CAPS = 0,
@@ -721,6 +742,10 @@ enum audio_diag_kind {
 	ADK_GET_PROC_ADDRESS,
 	ADK_LOAD_LIBRARY,
 	ADK_CO_CREATE_INSTANCE,
+	ADK_CREATE_SOUND,
+	ADK_DELETE_SOUND,
+	ADK_SOUND_PLAY,
+	ADK_SOUND_STOP,
 	COUNT_ADK
 };
 
@@ -2343,6 +2368,15 @@ struct injected_state {
 		// otherwise rewrite the field name out from under us.
 		FARPROC (WINAPI * orig_get_proc_address) (HMODULE, char const *);
 		HMODULE (WINAPI * orig_load_library) (char const *);
+
+		// sound.dll's create_sound and delete_sound, handed back to the game as wrappers so a sound's whole life is visible, plus the Play
+		// and Stop the wrapper finds in the first sound object's vtable.
+		int (__cdecl * orig_create_sound) (Sound_Core ** out_sound_core, char const * file_path, int sound_core_type);
+		int (__cdecl * orig_delete_sound) (Sound_Core * sound_core);
+		int (__fastcall * sound_core_play) (Sound_Core * this, int edx);
+		int (__fastcall * sound_core_stop) (Sound_Core * this, int edx);
+		Sound_Core_vtable * hooked_sound_vtables[MAX_HOOKED_SOUND_VTABLES];
+		int hooked_sound_vtable_count;
 
 		// sound.dll's own CoCreateInstance, hooked so we can see which COM classes it asks for and whether it gets them.
 		long (WINAPI * orig_co_create_instance) (void *, void *, unsigned, void *, void **);
