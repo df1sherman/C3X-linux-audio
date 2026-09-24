@@ -34219,6 +34219,13 @@ flush_audio_diagnostics ()
 		return;
 	ad->config_has_been_read = true;
 
+	// Also printed unconditionally, and also only once. Together with the line from set_up_audio_diagnostics it means a log always says whether
+	// the setting was picked up, instead of silence having to stand for both "turned off" and "something is broken".
+	snprintf (ss, sizeof ss, "C3X audio: config read, log_audio_diagnostics = %s\n",
+		  is->current_config.log_audio_diagnostics ? "true" : "false");
+	ss[(sizeof ss) - 1] = '\0';
+	(*p_OutputDebugStringA) (ss);
+
 	if (is->current_config.log_audio_diagnostics) {
 		(*p_OutputDebugStringA) ("C3X audio: ---- recorded during startup, before the config was read ----\n");
 		for (int n = 0; n < ad->buffered_line_count; n++)
@@ -34517,11 +34524,13 @@ set_up_audio_diagnostics ()
 
 	// Throughout, the original is recorded before the slot is redirected, never after, so a hook can never run without knowing what to call
 	// through to.
+	int timer_hooks_installed = 0;
 	for (int n = 0; n < ARRAY_LEN (winmm_hooks); n++) {
 		void ** slot = find_import_slot (NULL, "winmm.dll", winmm_hooks[n].name);
 		if (slot != NULL) {
 			*winmm_hooks[n].p_original = *slot;
 			replace_import (slot, winmm_hooks[n].replacement);
+			timer_hooks_installed += 1;
 		}
 	}
 
@@ -34540,6 +34549,19 @@ set_up_audio_diagnostics ()
 	// In case sound.dll was already loaded before we got here.
 	if (ad->sound_module == NULL)
 		ad->sound_module = (*p_GetModuleHandleA) ("sound.dll");
+
+	// This one line is printed whether or not the player asked for diagnostics, and it's the only such line at startup. It's here so that a log
+	// answers "is a build with the audio diagnostics actually installed, and did its hooks go in?" on its own. Without it, a log with no audio
+	// lines in it is ambiguous between an old build, a build whose hooks failed, and the option simply being off, which is not a distinction
+	// anyone should have to make by guesswork.
+	char ss[300];
+	snprintf (ss, sizeof ss, "C3X audio: diagnostics present; %d/%d timer hooks, LoadLibraryA %s, GetProcAddress %s, sound.dll %s\n",
+		  timer_hooks_installed, (int)ARRAY_LEN (winmm_hooks),
+		  (ad->orig_load_library != NULL) ? "hooked" : "NOT HOOKED",
+		  (ad->orig_get_proc_address != NULL) ? "hooked" : "NOT HOOKED",
+		  (ad->sound_module != NULL) ? "already loaded" : "not loaded yet");
+	ss[(sizeof ss) - 1] = '\0';
+	(*p_OutputDebugStringA) (ss);
 }
 
 bool
