@@ -720,6 +720,7 @@ enum audio_diag_kind {
 	ADK_TIME_KILL_EVENT,
 	ADK_GET_PROC_ADDRESS,
 	ADK_LOAD_LIBRARY,
+	ADK_CO_CREATE_INSTANCE,
 	COUNT_ADK
 };
 
@@ -2342,6 +2343,9 @@ struct injected_state {
 		// otherwise rewrite the field name out from under us.
 		FARPROC (WINAPI * orig_get_proc_address) (HMODULE, char const *);
 		HMODULE (WINAPI * orig_load_library) (char const *);
+
+		// sound.dll's own CoCreateInstance, hooked so we can see which COM classes it asks for and whether it gets them.
+		long (WINAPI * orig_co_create_instance) (void *, void *, unsigned, void *, void **);
 
 		HMODULE sound_module; // sound.dll once we've seen the game load it, NULL before then
 		bool reported_sound_imports; // so we only walk and report sound.dll's import table once

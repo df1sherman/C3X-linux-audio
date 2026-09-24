@@ -34428,10 +34428,10 @@ report_sound_dll_imports ()
 	for (IMAGE_IMPORT_DESCRIPTOR * desc = (IMAGE_IMPORT_DESCRIPTOR *)(image + import_dir->VirtualAddress); desc->Name != 0; desc++) {
 		char const * dll_name = (char *)(image + desc->Name);
 
-		// Spell out the individual functions only for the DLLs that could be carrying audio. Everything else gets a count.
-		bool audio_related = (_stricmp (dll_name, "winmm.dll") == 0) || (_stricmp (dll_name, "dsound.dll") == 0) ||
-				     (_stricmp (dll_name, "ole32.dll") == 0) || (_stricmp (dll_name, "dmusic.dll") == 0) ||
-				     (_stricmp (dll_name, "msacm32.dll") == 0);
+		// Spell out the individual functions for everything except the two big DLLs that can't be carrying audio. Naming the
+		// interesting DLLs instead was how mss32.dll, which turned out to be the actual playback engine, got reduced to a bare
+		// count. Listing by exclusion means the next surprise shows up on its own.
+		bool audio_related = (_stricmp (dll_name, "kernel32.dll") != 0) && (_stricmp (dll_name, "user32.dll") != 0);
 
 		int count = 0;
 		if (desc->OriginalFirstThunk != 0) {
@@ -34474,6 +34474,39 @@ names_sound_dll (char const * name)
 	return _stricmp (file_name, "sound.dll") == 0;
 }
 
+// Formats a GUID the way they are normally written, e.g. {5959df60-2911-11d1-b049-0020af30269a}, so it can be matched against what Wine prints.
+void
+format_guid (char * out, int out_size, byte const * guid)
+{
+	snprintf (out, out_size, "{%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x}",
+		  *(unsigned *)&guid[0], (unsigned)*(unsigned short *)&guid[4], (unsigned)*(unsigned short *)&guid[6],
+		  guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15]);
+	out[out_size - 1] = '\0';
+}
+
+// Wine reports a COM class it can't create on every run of the game. sound.dll is one of the things calling CoCreateInstance, so log what it asks
+// for and what it gets back; that says whether the failure is its and whether anything audio depends on it.
+long WINAPI
+patch_audio_diag_CoCreateInstance (void * rclsid, void * outer, unsigned ctx, void * riid, void ** ppv)
+{
+	long result = is->audio_diagnostics.orig_co_create_instance (rclsid, outer, ctx, riid, ppv);
+
+	if (should_log_audio_diag (ADK_CO_CREATE_INSTANCE)) {
+		char clsid_str[64];
+		if (rclsid != NULL)
+			format_guid (clsid_str, sizeof clsid_str, (byte *)rclsid);
+		else
+			strncpy (clsid_str, "(null)", sizeof clsid_str);
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: sound.dll CoCreateInstance %s -> 0x%08x%s\n",
+			  clsid_str, (unsigned)result, (result != 0) ? "   FAILED" : "");
+		ss[(sizeof ss) - 1] = '\0';
+		put_audio_diag (ss);
+	}
+
+	return result;
+}
+
 HMODULE WINAPI
 patch_audio_diag_LoadLibraryA (char const * file_name)
 {
@@ -34485,6 +34518,12 @@ patch_audio_diag_LoadLibraryA (char const * file_name)
 		// The loader has finished resolving sound.dll's imports by the time LoadLibraryA returns, so its import table is ready to patch. This
 		// is the hook that matters: the executable imports the timer API but never calls it, and sound.dll is what actually runs the timers.
 		int hooked = hook_winmm_timers (result, NULL);
+
+		void ** co_create_slot = find_import_slot (result, "ole32.dll", "CoCreateInstance");
+		if (co_create_slot != NULL) {
+			is->audio_diagnostics.orig_co_create_instance = (void *)*co_create_slot;
+			replace_import (co_create_slot, patch_audio_diag_CoCreateInstance);
+		}
 		char ss2[300];
 		snprintf (ss2, sizeof ss2, "C3X audio: hooked %d timer function(s) in sound.dll's own import table\n", hooked);
 		ss2[(sizeof ss2) - 1] = '\0';
