@@ -12,6 +12,7 @@
 - Option limit_detection_by_units_to_adjacent_tiles to restrict units' detect invisible ability to adjacent tiles
 - Option log_audio_diagnostics to help track down the sound problems that occur when running on Wine
 - Fix sound effects repeating forever when running on Wine, controlled by option stop_stuck_sounds
+  - Related option stuck_sound_margin sets how long a sound may run past its reported length before it is silenced
 - Fix city governors unable to assign workers to improvement-type districts after construction
 - Fix can_bombard_only_sea_tiles not applying to AI units or aerial defensive bombard
 - Fix some ways areas revealed by recon can stay permanently revealed
