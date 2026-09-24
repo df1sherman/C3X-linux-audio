@@ -34174,6 +34174,8 @@ patch_Trade_Net_set_unit_path_to_fill_road_net (Trade_Net * this, int edx, int f
 // than through find_import_slot.
 //
 
+int hook_winmm_timers (HMODULE module); // defined below, used by the LoadLibraryA hook above it
+
 // Returns true if this kind of event should still be recorded. Each kind goes quiet after MAX_AUDIO_DIAG_LOGS so that a function the game calls
 // constantly can't bury everything else.
 bool
@@ -34407,19 +34409,51 @@ report_sound_dll_imports ()
 		return;
 	ad->reported_sound_imports = true;
 
-	struct { char const * dll; char const * func; } const to_check[] = {
-		{"winmm.dll",  "timeSetEvent"},
-		{"winmm.dll",  "timeBeginPeriod"},
-		{"winmm.dll",  "waveOutWrite"},
-		{"winmm.dll",  "waveOutOpen"},
-		{"winmm.dll",  "midiOutShortMsg"},
-		{"dsound.dll", "DirectSoundCreate"}
-	};
+	// Walk sound.dll's own import table rather than probing for a handful of guessed names. The first pass through this probed for waveOut and
+	// DirectSound, got "no" for both, and left the question of how it actually reaches the sound card unanswered. Listing what's really there
+	// answers it, and names are only spelled out for the DLLs that could plausibly carry audio so the log stays readable.
+	byte * image = (byte *)ad->sound_module;
+	IMAGE_DOS_HEADER * dos_header = (IMAGE_DOS_HEADER *)image;
+	if (dos_header->e_magic != IMAGE_DOS_SIGNATURE)
+		return;
+	IMAGE_NT_HEADERS * nt_headers = (IMAGE_NT_HEADERS *)(image + dos_header->e_lfanew);
+	if (nt_headers->Signature != IMAGE_NT_SIGNATURE)
+		return;
+	IMAGE_DATA_DIRECTORY * import_dir = &nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+	if (import_dir->VirtualAddress == 0) {
+		put_audio_diag ("C3X audio: sound.dll has no import directory\n");
+		return;
+	}
 
-	for (int n = 0; n < ARRAY_LEN (to_check); n++) {
-		void ** slot = find_import_slot (ad->sound_module, to_check[n].dll, to_check[n].func);
-		snprintf (ss, sizeof ss, "C3X audio: sound.dll imports %s!%s: %s\n",
-			  to_check[n].dll, to_check[n].func, (slot != NULL) ? "yes" : "no");
+	for (IMAGE_IMPORT_DESCRIPTOR * desc = (IMAGE_IMPORT_DESCRIPTOR *)(image + import_dir->VirtualAddress); desc->Name != 0; desc++) {
+		char const * dll_name = (char *)(image + desc->Name);
+
+		// Spell out the individual functions only for the DLLs that could be carrying audio. Everything else gets a count.
+		bool audio_related = (_stricmp (dll_name, "winmm.dll") == 0) || (_stricmp (dll_name, "dsound.dll") == 0) ||
+				     (_stricmp (dll_name, "ole32.dll") == 0) || (_stricmp (dll_name, "dmusic.dll") == 0) ||
+				     (_stricmp (dll_name, "msacm32.dll") == 0);
+
+		int count = 0;
+		if (desc->OriginalFirstThunk != 0) {
+			IMAGE_THUNK_DATA * names = (IMAGE_THUNK_DATA *)(image + desc->OriginalFirstThunk);
+			for (; names->u1.AddressOfData != 0; names++) {
+				count += 1;
+				if (! audio_related)
+					continue;
+				if (IMAGE_SNAP_BY_ORDINAL (names->u1.Ordinal))
+					snprintf (ss, sizeof ss, "C3X audio:   %s ordinal %u\n", dll_name,
+						  (unsigned)(names->u1.Ordinal & 0xFFFF));
+				else {
+					IMAGE_IMPORT_BY_NAME * by_name = (IMAGE_IMPORT_BY_NAME *)(image + names->u1.AddressOfData);
+					snprintf (ss, sizeof ss, "C3X audio:   %s!%s\n", dll_name, (char *)by_name->Name);
+				}
+				ss[(sizeof ss) - 1] = '\0';
+				put_audio_diag (ss);
+			}
+		}
+
+		snprintf (ss, sizeof ss, "C3X audio: sound.dll imports %d function(s) from %s%s\n",
+			  count, dll_name, audio_related ? " (listed above)" : "");
 		ss[(sizeof ss) - 1] = '\0';
 		put_audio_diag (ss);
 	}
@@ -34445,8 +34479,16 @@ patch_audio_diag_LoadLibraryA (char const * file_name)
 {
 	HMODULE result = is->audio_diagnostics.orig_load_library (file_name);
 
-	if (names_sound_dll (file_name)) {
+	if (names_sound_dll (file_name) && (result != NULL)) {
 		is->audio_diagnostics.sound_module = result;
+
+		// The loader has finished resolving sound.dll's imports by the time LoadLibraryA returns, so its import table is ready to patch. This
+		// is the hook that matters: the executable imports the timer API but never calls it, and sound.dll is what actually runs the timers.
+		int hooked = hook_winmm_timers (result);
+		char ss2[300];
+		snprintf (ss2, sizeof ss2, "C3X audio: hooked %d timer function(s) in sound.dll's own import table\n", hooked);
+		ss2[(sizeof ss2) - 1] = '\0';
+		put_audio_diag (ss2);
 		if (should_log_audio_diag (ADK_LOAD_LIBRARY)) {
 			char ss[300];
 			snprintf (ss, sizeof ss, "C3X audio: game loaded \"%s\" -> module 0x%p\n", file_name, result);
@@ -34486,6 +34528,42 @@ patch_audio_diag_GetProcAddress (HMODULE module, char const * proc_name)
 	return result;
 }
 
+// Redirects a module's imports of the multimedia timer functions to our loggers and returns how many went in. Pass NULL for the module to hook the
+// game's executable. This is a separate function because the timers that matter turned out not to be the executable's: it imports the whole timer
+// API but never calls it, while sound.dll, which is loaded dynamically and so has an import table of its own, is what actually drives the audio.
+int
+hook_winmm_timers (HMODULE module)
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+
+	struct { char const * name; void * replacement; void ** p_original; } const winmm_hooks[] = {
+		{"timeGetDevCaps" , patch_timeGetDevCaps , (void **)&ad->timeGetDevCaps },
+		{"timeBeginPeriod", patch_timeBeginPeriod, (void **)&ad->timeBeginPeriod},
+		{"timeEndPeriod"  , patch_timeEndPeriod  , (void **)&ad->timeEndPeriod  },
+		{"timeSetEvent"   , patch_timeSetEvent   , (void **)&ad->timeSetEvent   },
+		{"timeKillEvent"  , patch_timeKillEvent  , (void **)&ad->timeKillEvent  }
+	};
+
+	int installed = 0;
+	for (int n = 0; n < ARRAY_LEN (winmm_hooks); n++) {
+		void ** slot = find_import_slot (module, "winmm.dll", winmm_hooks[n].name);
+		if (slot == NULL)
+			continue;
+
+		// Every module's slot for a given function holds the same address, winmm's real one, so recording it more than once is harmless.
+		// Skip a slot already pointing at our own hook so we can never end up calling ourselves.
+		if (*slot == winmm_hooks[n].replacement)
+			continue;
+
+		// The original is recorded before the slot is redirected, never after, so a hook can't run without knowing what to call through to.
+		*winmm_hooks[n].p_original = *slot;
+		replace_import (slot, winmm_hooks[n].replacement);
+		installed += 1;
+	}
+
+	return installed;
+}
+
 // Installs all of the diagnostic hooks. Called from patch_init_floating_point, which runs at the end of CRT initialization, before the game's global
 // constructors and long before it sets up its sound timers or loads sound.dll.
 //
@@ -34514,25 +34592,7 @@ set_up_audio_diagnostics ()
 	for (int n = 0; n < COUNT_ADK; n++)
 		ad->log_counts[n] = 0;
 
-	struct { char const * name; void * replacement; void ** p_original; } const winmm_hooks[] = {
-		{"timeGetDevCaps" , patch_timeGetDevCaps , (void **)&ad->timeGetDevCaps },
-		{"timeBeginPeriod", patch_timeBeginPeriod, (void **)&ad->timeBeginPeriod},
-		{"timeEndPeriod"  , patch_timeEndPeriod  , (void **)&ad->timeEndPeriod  },
-		{"timeSetEvent"   , patch_timeSetEvent   , (void **)&ad->timeSetEvent   },
-		{"timeKillEvent"  , patch_timeKillEvent  , (void **)&ad->timeKillEvent  }
-	};
-
-	// Throughout, the original is recorded before the slot is redirected, never after, so a hook can never run without knowing what to call
-	// through to.
-	int timer_hooks_installed = 0;
-	for (int n = 0; n < ARRAY_LEN (winmm_hooks); n++) {
-		void ** slot = find_import_slot (NULL, "winmm.dll", winmm_hooks[n].name);
-		if (slot != NULL) {
-			*winmm_hooks[n].p_original = *slot;
-			replace_import (slot, winmm_hooks[n].replacement);
-			timer_hooks_installed += 1;
-		}
-	}
+	int timer_hooks_installed = hook_winmm_timers (NULL);
 
 	// Watch the game load sound.dll and resolve its exports. sound.dll isn't statically imported so this is the only way to see it happen.
 	void ** load_library_slot = find_import_slot (NULL, "kernel32.dll", "LoadLibraryA");
@@ -34555,8 +34615,8 @@ set_up_audio_diagnostics ()
 	// lines in it is ambiguous between an old build, a build whose hooks failed, and the option simply being off, which is not a distinction
 	// anyone should have to make by guesswork.
 	char ss[300];
-	snprintf (ss, sizeof ss, "C3X audio: diagnostics present; %d/%d timer hooks, LoadLibraryA %s, GetProcAddress %s, sound.dll %s\n",
-		  timer_hooks_installed, (int)ARRAY_LEN (winmm_hooks),
+	snprintf (ss, sizeof ss, "C3X audio: diagnostics present; %d/%d timer hooks in the exe, LoadLibraryA %s, GetProcAddress %s, sound.dll %s\n",
+		  timer_hooks_installed, COUNT_WINMM_TIMER_HOOKS,
 		  (ad->orig_load_library != NULL) ? "hooked" : "NOT HOOKED",
 		  (ad->orig_get_proc_address != NULL) ? "hooked" : "NOT HOOKED",
 		  (ad->sound_module != NULL) ? "already loaded" : "not loaded yet");
