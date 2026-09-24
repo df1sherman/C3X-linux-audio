@@ -34459,6 +34459,87 @@ report_sound_dll_imports ()
 	}
 }
 
+// Returns the name sound.dll exports under an ordinal, or NULL if the ordinal has no name. The game resolves everything from sound.dll by ordinal,
+// so without this the log can only say "ordinal 4" and never which function that is.
+char const *
+find_export_name (HMODULE module, unsigned ordinal)
+{
+	byte * image = (byte *)module;
+	if (image == NULL)
+		return NULL;
+
+	IMAGE_DOS_HEADER * dos_header = (IMAGE_DOS_HEADER *)image;
+	if (dos_header->e_magic != IMAGE_DOS_SIGNATURE)
+		return NULL;
+	IMAGE_NT_HEADERS * nt_headers = (IMAGE_NT_HEADERS *)(image + dos_header->e_lfanew);
+	if (nt_headers->Signature != IMAGE_NT_SIGNATURE)
+		return NULL;
+	IMAGE_DATA_DIRECTORY * export_dir_entry = &nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+	if (export_dir_entry->VirtualAddress == 0)
+		return NULL;
+
+	IMAGE_EXPORT_DIRECTORY * exports = (IMAGE_EXPORT_DIRECTORY *)(image + export_dir_entry->VirtualAddress);
+	DWORD * name_rvas = (DWORD *)(image + exports->AddressOfNames);
+	WORD * name_ordinals = (WORD *)(image + exports->AddressOfNameOrdinals);
+
+	for (unsigned n = 0; n < exports->NumberOfNames; n++)
+		if ((unsigned)name_ordinals[n] + exports->Base == ordinal)
+			return (char *)(image + name_rvas[n]);
+
+	return NULL;
+}
+
+// Lists everything sound.dll exports, with its ordinal. The game asks for its functions purely by number, so this is what turns those numbers into
+// something that can be reasoned about, and it says which of them are worth hooking to watch a sound start and stop.
+void
+report_sound_dll_exports ()
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+	char ss[300];
+
+	byte * image = (byte *)ad->sound_module;
+	if (image == NULL)
+		return;
+
+	IMAGE_DOS_HEADER * dos_header = (IMAGE_DOS_HEADER *)image;
+	if (dos_header->e_magic != IMAGE_DOS_SIGNATURE)
+		return;
+	IMAGE_NT_HEADERS * nt_headers = (IMAGE_NT_HEADERS *)(image + dos_header->e_lfanew);
+	if (nt_headers->Signature != IMAGE_NT_SIGNATURE)
+		return;
+	IMAGE_DATA_DIRECTORY * export_dir_entry = &nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+	if (export_dir_entry->VirtualAddress == 0) {
+		put_audio_diag ("C3X audio: sound.dll has no export directory\n");
+		return;
+	}
+
+	IMAGE_EXPORT_DIRECTORY * exports = (IMAGE_EXPORT_DIRECTORY *)(image + export_dir_entry->VirtualAddress);
+	DWORD * function_rvas = (DWORD *)(image + exports->AddressOfFunctions);
+	DWORD * name_rvas = (DWORD *)(image + exports->AddressOfNames);
+	WORD * name_ordinals = (WORD *)(image + exports->AddressOfNameOrdinals);
+
+	snprintf (ss, sizeof ss, "C3X audio: sound.dll exports %u function(s), %u of them named, ordinals start at %u\n",
+		  (unsigned)exports->NumberOfFunctions, (unsigned)exports->NumberOfNames, (unsigned)exports->Base);
+	ss[(sizeof ss) - 1] = '\0';
+	put_audio_diag (ss);
+
+	for (unsigned n = 0; n < exports->NumberOfFunctions; n++) {
+		unsigned ordinal = exports->Base + n;
+
+		char const * name = NULL;
+		for (unsigned k = 0; k < exports->NumberOfNames; k++)
+			if ((unsigned)name_ordinals[k] == n) {
+				name = (char *)(image + name_rvas[k]);
+				break;
+			}
+
+		snprintf (ss, sizeof ss, "C3X audio:   ordinal %u -> 0x%p  %s\n",
+			  ordinal, (void *)(image + function_rvas[n]), (name != NULL) ? name : "(no name)");
+		ss[(sizeof ss) - 1] = '\0';
+		put_audio_diag (ss);
+	}
+}
+
 // True if the path or module name refers to sound.dll. The game may pass a full path, so match the file name at the end.
 bool
 names_sound_dll (char const * name)
@@ -34535,6 +34616,7 @@ patch_audio_diag_LoadLibraryA (char const * file_name)
 			put_audio_diag (ss);
 		}
 		report_sound_dll_imports ();
+		report_sound_dll_exports ();
 	}
 
 	return result;
@@ -34557,7 +34639,12 @@ patch_audio_diag_GetProcAddress (HMODULE module, char const * proc_name)
 		// Exports can be requested by ordinal instead of by name, in which case the "name" is a small integer rather than a pointer. That's
 		// how Civ 3 asks for the wave and midi device constructors, whose real names are C++ mangled.
 		if (((unsigned)proc_name & 0xFFFF0000) == 0)
-			snprintf (ss, sizeof ss, "C3X audio: game resolved sound.dll ordinal %u -> 0x%p\n", (unsigned)proc_name, result);
+		{
+			unsigned ordinal = (unsigned)proc_name;
+			char const * name = find_export_name (module, ordinal);
+			snprintf (ss, sizeof ss, "C3X audio: game resolved sound.dll ordinal %u (%s) -> 0x%p\n",
+				  ordinal, (name != NULL) ? name : "no name", result);
+		}
 		else
 			snprintf (ss, sizeof ss, "C3X audio: game resolved sound.dll \"%s\" -> 0x%p\n", proc_name, result);
 		ss[(sizeof ss) - 1] = '\0';
