@@ -34185,7 +34185,13 @@ should_log_audio_diag (enum audio_diag_kind kind)
 	// flush_audio_diagnostics decide later. Everything the game does to set up its audio happens in that window.
 	if (is->audio_diagnostics.config_has_been_read && ! is->current_config.log_audio_diagnostics)
 		return false;
-	if (is->audio_diagnostics.log_counts[kind] >= MAX_AUDIO_DIAG_LOGS)
+	// The sound lifecycle events get a much larger allowance than the rest. At the shared limit the preload alone used the whole budget for
+	// create_sound, so nothing the game did afterwards was recorded.
+	int limit = MAX_AUDIO_DIAG_LOGS;
+	if ((kind == ADK_CREATE_SOUND) || (kind == ADK_DELETE_SOUND) || (kind == ADK_SOUND_PLAY) || (kind == ADK_SOUND_STOP))
+		limit = MAX_SOUND_EVENT_LOGS;
+
+	if (is->audio_diagnostics.log_counts[kind] >= limit)
 		return false;
 	is->audio_diagnostics.log_counts[kind] += 1;
 	return true;
@@ -34394,71 +34400,6 @@ patch_timeKillEvent (unsigned timer_id)
 // resolve its exports.
 //
 
-// Logs which DLLs sound.dll itself imports the interesting functions from. This is what tells us where the audio actually gets pumped: if sound.dll
-// runs its own multimedia timer, or talks to DirectSound, then hooking the executable's imports would never reach it and a fix would have to go
-// into sound.dll's import table instead.
-void
-report_sound_dll_imports ()
-{
-	struct audio_diagnostics * ad = &is->audio_diagnostics;
-	char ss[300];
-
-	// Deliberately not gated on the setting here. This runs while sound.dll is being loaded, which is before the config has been read, so the
-	// report goes into the buffer and flush_audio_diagnostics decides whether it ever gets printed.
-	if (ad->reported_sound_imports || (ad->sound_module == NULL))
-		return;
-	ad->reported_sound_imports = true;
-
-	// Walk sound.dll's own import table rather than probing for a handful of guessed names. The first pass through this probed for waveOut and
-	// DirectSound, got "no" for both, and left the question of how it actually reaches the sound card unanswered. Listing what's really there
-	// answers it, and names are only spelled out for the DLLs that could plausibly carry audio so the log stays readable.
-	byte * image = (byte *)ad->sound_module;
-	IMAGE_DOS_HEADER * dos_header = (IMAGE_DOS_HEADER *)image;
-	if (dos_header->e_magic != IMAGE_DOS_SIGNATURE)
-		return;
-	IMAGE_NT_HEADERS * nt_headers = (IMAGE_NT_HEADERS *)(image + dos_header->e_lfanew);
-	if (nt_headers->Signature != IMAGE_NT_SIGNATURE)
-		return;
-	IMAGE_DATA_DIRECTORY * import_dir = &nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-	if (import_dir->VirtualAddress == 0) {
-		put_audio_diag ("C3X audio: sound.dll has no import directory\n");
-		return;
-	}
-
-	for (IMAGE_IMPORT_DESCRIPTOR * desc = (IMAGE_IMPORT_DESCRIPTOR *)(image + import_dir->VirtualAddress); desc->Name != 0; desc++) {
-		char const * dll_name = (char *)(image + desc->Name);
-
-		// Spell out the individual functions for everything except the two big DLLs that can't be carrying audio. Naming the
-		// interesting DLLs instead was how mss32.dll, which turned out to be the actual playback engine, got reduced to a bare
-		// count. Listing by exclusion means the next surprise shows up on its own.
-		bool audio_related = (_stricmp (dll_name, "kernel32.dll") != 0) && (_stricmp (dll_name, "user32.dll") != 0);
-
-		int count = 0;
-		if (desc->OriginalFirstThunk != 0) {
-			IMAGE_THUNK_DATA * names = (IMAGE_THUNK_DATA *)(image + desc->OriginalFirstThunk);
-			for (; names->u1.AddressOfData != 0; names++) {
-				count += 1;
-				if (! audio_related)
-					continue;
-				if (IMAGE_SNAP_BY_ORDINAL (names->u1.Ordinal))
-					snprintf (ss, sizeof ss, "C3X audio:   %s ordinal %u\n", dll_name,
-						  (unsigned)(names->u1.Ordinal & 0xFFFF));
-				else {
-					IMAGE_IMPORT_BY_NAME * by_name = (IMAGE_IMPORT_BY_NAME *)(image + names->u1.AddressOfData);
-					snprintf (ss, sizeof ss, "C3X audio:   %s!%s\n", dll_name, (char *)by_name->Name);
-				}
-				ss[(sizeof ss) - 1] = '\0';
-				put_audio_diag (ss);
-			}
-		}
-
-		snprintf (ss, sizeof ss, "C3X audio: sound.dll imports %d function(s) from %s%s\n",
-			  count, dll_name, audio_related ? " (listed above)" : "");
-		ss[(sizeof ss) - 1] = '\0';
-		put_audio_diag (ss);
-	}
-}
-
 // Returns the name sound.dll exports under an ordinal, or NULL if the ordinal has no name. The game resolves everything from sound.dll by ordinal,
 // so without this the log can only say "ordinal 4" and never which function that is.
 char const *
@@ -34497,9 +34438,11 @@ report_sound_dll_exports ()
 	struct audio_diagnostics * ad = &is->audio_diagnostics;
 	char ss[300];
 
-	byte * image = (byte *)ad->sound_module;
-	if (image == NULL)
+	if (ad->reported_sound_exports || (ad->sound_module == NULL))
 		return;
+	ad->reported_sound_exports = true;
+
+	byte * image = (byte *)ad->sound_module;
 
 	IMAGE_DOS_HEADER * dos_header = (IMAGE_DOS_HEADER *)image;
 	if (dos_header->e_magic != IMAGE_DOS_SIGNATURE)
@@ -34545,29 +34488,102 @@ report_sound_dll_exports ()
 // or one it does stop without the stop taking effect. Everything here still only logs.
 //
 
+// Remembers which file a sound object was made from. Returns false if there was no room.
+bool
+remember_sound_path (Sound_Core * core, char const * file_path)
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+
+	struct tracked_sound * slot = NULL;
+	for (int n = 0; n < MAX_TRACKED_SOUNDS; n++)
+		if ((ad->tracked_sounds[n].core == core) || (ad->tracked_sounds[n].core == NULL)) {
+			slot = &ad->tracked_sounds[n];
+			break;
+		}
+	if (slot == NULL)
+		return false;
+
+	slot->core = core;
+	if (file_path != NULL) {
+		strncpy (slot->path, file_path, SOUND_PATH_LEN - 1);
+		slot->path[SOUND_PATH_LEN - 1] = '\0';
+	} else
+		slot->path[0] = '\0';
+	return true;
+}
+
+// The file a sound object was made from, or a placeholder if it isn't one we saw created.
+char const *
+sound_path (Sound_Core * core)
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+	for (int n = 0; n < MAX_TRACKED_SOUNDS; n++)
+		if (ad->tracked_sounds[n].core == core)
+			return ad->tracked_sounds[n].path;
+	return "unknown";
+}
+
+void
+forget_sound_path (Sound_Core * core)
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+	for (int n = 0; n < MAX_TRACKED_SOUNDS; n++)
+		if (ad->tracked_sounds[n].core == core) {
+			ad->tracked_sounds[n].core = NULL;
+			ad->tracked_sounds[n].path[0] = '\0';
+			return;
+		}
+}
+
+// The saved originals for a sound object's vtable, or NULL if that vtable was never hooked.
+struct hooked_sound_vtable *
+find_hooked_sound_vtable (Sound_Core_vtable * vtable)
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+	for (int n = 0; n < ad->hooked_sound_vtable_count; n++)
+		if (ad->hooked_sound_vtables[n].vtable == vtable)
+			return &ad->hooked_sound_vtables[n];
+	return NULL;
+}
+
 int __fastcall
 patch_sound_core_play (Sound_Core * this, int edx)
 {
+	struct hooked_sound_vtable * hooked = ((this != NULL) && (this->vtable != NULL)) ? find_hooked_sound_vtable (this->vtable) : NULL;
+
 	if (should_log_audio_diag (ADK_SOUND_PLAY)) {
 		char ss[300];
-		snprintf (ss, sizeof ss, "C3X audio: sound 0x%p PLAY\n", (void *)this);
+		snprintf (ss, sizeof ss, "C3X audio: PLAY  \"%s\" (sound 0x%p)\n", sound_path (this), (void *)this);
 		ss[(sizeof ss) - 1] = '\0';
 		put_audio_diag (ss);
 	}
 
-	return is->audio_diagnostics.sound_core_play (this, __);
+	// Can only happen if a vtable was rewritten under us, which would mean the address we are about to call is not ours to guess at.
+	if (hooked == NULL) {
+		put_audio_diag ("C3X audio: PLAY on a sound whose vtable is not one we hooked, letting it go unhandled\n");
+		return 0;
+	}
+
+	return hooked->Play (this, __);
 }
 
 int __fastcall
 patch_sound_core_stop (Sound_Core * this, int edx)
 {
-	int result = is->audio_diagnostics.sound_core_stop (this, __);
+	struct hooked_sound_vtable * hooked = ((this != NULL) && (this->vtable != NULL)) ? find_hooked_sound_vtable (this->vtable) : NULL;
+	if (hooked == NULL) {
+		put_audio_diag ("C3X audio: STOP on a sound whose vtable is not one we hooked, letting it go unhandled\n");
+		return 0;
+	}
 
-	// Logged after the call so the return value is in the line. If stops are being issued and the sound carries on regardless, this is where it
-	// shows up.
+	int result = hooked->Stop (this, __);
+
+	// Logged after the call so the return value is in the line. A non-zero return is sound.dll refusing the stop, which is the difference
+	// between a sound nobody asked to stop and one that would not.
 	if (should_log_audio_diag (ADK_SOUND_STOP)) {
 		char ss[300];
-		snprintf (ss, sizeof ss, "C3X audio: sound 0x%p STOP returned %d\n", (void *)this, result);
+		snprintf (ss, sizeof ss, "C3X audio: STOP  \"%s\" (sound 0x%p) returned %d%s\n",
+			  sound_path (this), (void *)this, result, (result != 0) ? "   <-- REFUSED" : "");
 		ss[(sizeof ss) - 1] = '\0';
 		put_audio_diag (ss);
 	}
@@ -34575,46 +34591,39 @@ patch_sound_core_stop (Sound_Core * this, int edx)
 	return result;
 }
 
-// Redirects Play and Stop in a sound object's vtable, unless this vtable has already been done. Sound objects of the same kind share one, so this
-// only does real work the first few times.
+// Redirects Play and Stop in a sound object's vtable, unless this vtable has already been done. Each kind of sound has its own vtable, so this runs
+// a handful of times rather than once.
 void
 hook_sound_core_vtable (Sound_Core * core)
 {
 	struct audio_diagnostics * ad = &is->audio_diagnostics;
 	char ss[300];
 
-	if ((core == NULL) || (core->vtable == NULL))
+	if ((core == NULL) || (core->vtable == NULL) || (find_hooked_sound_vtable (core->vtable) != NULL))
 		return;
-
-	for (int n = 0; n < ad->hooked_sound_vtable_count; n++)
-		if (ad->hooked_sound_vtables[n] == core->vtable)
-			return;
 
 	if (ad->hooked_sound_vtable_count >= MAX_HOOKED_SOUND_VTABLES) {
-		put_audio_diag ("C3X audio: out of room to hook sound vtables\n");
+		snprintf (ss, sizeof ss, "C3X audio: out of room to hook sound vtables, sounds using 0x%p go unwatched\n", (void *)core->vtable);
+		ss[(sizeof ss) - 1] = '\0';
+		put_audio_diag (ss);
 		return;
 	}
 
-	// Record the originals from the first vtable we see. If a later one points Play or Stop somewhere else then calling through our saved copies
-	// would run the wrong code, so leave that vtable alone and say so rather than guess.
-	if (ad->hooked_sound_vtable_count > 0) {
-		if ((core->vtable->Play != ad->sound_core_play) || (core->vtable->Stop != ad->sound_core_stop)) {
-			snprintf (ss, sizeof ss, "C3X audio: sound vtable 0x%p has different Play/Stop, not hooking it\n", (void *)core->vtable);
-			ss[(sizeof ss) - 1] = '\0';
-			put_audio_diag (ss);
-			return;
-		}
-	} else {
-		ad->sound_core_play = core->vtable->Play;
-		ad->sound_core_stop = core->vtable->Stop;
-	}
+	// Record this vtable's own Play and Stop. An earlier version kept a single pair shared across all vtables and refused any that did not
+	// match, which meant only the first kind of sound was ever watched and the rest were silently skipped.
+	struct hooked_sound_vtable * entry = &ad->hooked_sound_vtables[ad->hooked_sound_vtable_count];
+	entry->vtable = core->vtable;
+	entry->Play = core->vtable->Play;
+	entry->Stop = core->vtable->Stop;
+
+	// Publish the entry before redirecting, so a call arriving in between still finds what to call through to.
+	ad->hooked_sound_vtable_count += 1;
 
 	// Play and Stop are adjacent, so one call covers both.
 	WITH_MEM_PROTECTION (&core->vtable->Play, 2 * sizeof (void *), PAGE_READWRITE) {
 		core->vtable->Play = patch_sound_core_play;
 		core->vtable->Stop = patch_sound_core_stop;
 	}
-	ad->hooked_sound_vtables[ad->hooked_sound_vtable_count++] = core->vtable;
 
 	snprintf (ss, sizeof ss, "C3X audio: hooked Play/Stop in sound vtable 0x%p\n", (void *)core->vtable);
 	ss[(sizeof ss) - 1] = '\0';
@@ -34627,12 +34636,15 @@ patch_create_sound (Sound_Core ** out_sound_core, char const * file_path, int so
 	int result = is->audio_diagnostics.orig_create_sound (out_sound_core, file_path, sound_core_type);
 	Sound_Core * core = ((out_sound_core != NULL) && (result == 0)) ? *out_sound_core : NULL;
 
-	if (core != NULL)
+	if (core != NULL) {
 		hook_sound_core_vtable (core);
+		if (! remember_sound_path (core, file_path))
+			put_audio_diag ("C3X audio: out of room to remember sound filenames\n");
+	}
 
 	if (should_log_audio_diag (ADK_CREATE_SOUND)) {
 		char ss[300];
-		snprintf (ss, sizeof ss, "C3X audio: create_sound(\"%s\", type %d) -> sound 0x%p, returned %d\n",
+		snprintf (ss, sizeof ss, "C3X audio: create \"%s\" type %d -> sound 0x%p, returned %d\n",
 			  (file_path != NULL) ? file_path : "(none)", sound_core_type, (void *)core, result);
 		ss[(sizeof ss) - 1] = '\0';
 		put_audio_diag (ss);
@@ -34646,11 +34658,12 @@ patch_delete_sound (Sound_Core * sound_core)
 {
 	if (should_log_audio_diag (ADK_DELETE_SOUND)) {
 		char ss[300];
-		snprintf (ss, sizeof ss, "C3X audio: delete_sound(sound 0x%p)\n", (void *)sound_core);
+		snprintf (ss, sizeof ss, "C3X audio: delete \"%s\" (sound 0x%p)\n", sound_path (sound_core), (void *)sound_core);
 		ss[(sizeof ss) - 1] = '\0';
 		put_audio_diag (ss);
 	}
 
+	forget_sound_path (sound_core);
 	return is->audio_diagnostics.orig_delete_sound (sound_core);
 }
 
@@ -34729,7 +34742,6 @@ patch_audio_diag_LoadLibraryA (char const * file_name)
 			ss[(sizeof ss) - 1] = '\0';
 			put_audio_diag (ss);
 		}
-		report_sound_dll_imports ();
 		report_sound_dll_exports ();
 	}
 
@@ -34745,8 +34757,6 @@ patch_audio_diag_GetProcAddress (HMODULE module, char const * proc_name)
 	// Only interested in sound.dll. Everything else goes straight through.
 	if ((module == NULL) || (module != is->audio_diagnostics.sound_module))
 		return result;
-
-	report_sound_dll_imports (); // no-op unless it hasn't been done yet, which is the case if logging got turned on after sound.dll loaded
 
 	// Exports can be requested by ordinal instead of by name, in which case the "name" is a small integer rather than a pointer. That's how Civ 3
 	// asks for everything, including the wave and midi device constructors whose real names are C++ mangled.
@@ -34844,12 +34854,17 @@ set_up_audio_diagnostics ()
 	ad->orig_get_proc_address = NULL;
 	ad->orig_load_library = NULL;
 	ad->sound_module = NULL;
-	ad->reported_sound_imports = false;
+	ad->reported_sound_exports = false;
 	ad->config_has_been_read = false;
 	ad->buffered_line_count = 0;
 	ad->dropped_line_count = 0;
 	for (int n = 0; n < COUNT_ADK; n++)
 		ad->log_counts[n] = 0;
+	ad->hooked_sound_vtable_count = 0;
+	for (int n = 0; n < MAX_TRACKED_SOUNDS; n++) {
+		ad->tracked_sounds[n].core = NULL;
+		ad->tracked_sounds[n].path[0] = '\0';
+	}
 
 	int timer_hooks_total = 0;
 	int timer_hooks_installed = hook_winmm_timers (NULL, &timer_hooks_total);
