@@ -720,6 +720,7 @@ enum audio_diag_kind {
 	ADK_TIME_KILL_EVENT,
 	ADK_GET_PROC_ADDRESS,
 	ADK_LOAD_LIBRARY,
+	ADK_CO_CREATE_INSTANCE,
 	COUNT_ADK
 };
 
@@ -729,9 +730,6 @@ enum audio_diag_kind {
 // The game sets up its sound timers and loads sound.dll while it's starting, which is long before C3X reads any config file, so at the time those
 // calls happen we don't yet know whether the player asked for diagnostics. Lines produced that early are held in a buffer of this size and then
 // either printed or thrown away once the config has been read. Listing sound.dll's imports is what sets the size.
-// How many multimedia timer functions hook_winmm_timers redirects per module.
-#define COUNT_WINMM_TIMER_HOOKS 5
-
 #define AUDIO_DIAG_BUFFER_LINES 256
 #define AUDIO_DIAG_LINE_LEN 256
 
@@ -2345,6 +2343,9 @@ struct injected_state {
 		// otherwise rewrite the field name out from under us.
 		FARPROC (WINAPI * orig_get_proc_address) (HMODULE, char const *);
 		HMODULE (WINAPI * orig_load_library) (char const *);
+
+		// sound.dll's own CoCreateInstance, hooked so we can see which COM classes it asks for and whether it gets them.
+		long (WINAPI * orig_co_create_instance) (void *, void *, unsigned, void *, void **);
 
 		HMODULE sound_module; // sound.dll once we've seen the game load it, NULL before then
 		bool reported_sound_imports; // so we only walk and report sound.dll's import table once
