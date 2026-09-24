@@ -34540,6 +34540,120 @@ report_sound_dll_exports ()
 	}
 }
 
+//
+// Watching a sound begin and end. This is the part the whole investigation was working towards: whether a stuck sound is one the game never stops,
+// or one it does stop without the stop taking effect. Everything here still only logs.
+//
+
+int __fastcall
+patch_sound_core_play (Sound_Core * this, int edx)
+{
+	if (should_log_audio_diag (ADK_SOUND_PLAY)) {
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: sound 0x%p PLAY\n", (void *)this);
+		ss[(sizeof ss) - 1] = '\0';
+		put_audio_diag (ss);
+	}
+
+	return is->audio_diagnostics.sound_core_play (this, __);
+}
+
+int __fastcall
+patch_sound_core_stop (Sound_Core * this, int edx)
+{
+	int result = is->audio_diagnostics.sound_core_stop (this, __);
+
+	// Logged after the call so the return value is in the line. If stops are being issued and the sound carries on regardless, this is where it
+	// shows up.
+	if (should_log_audio_diag (ADK_SOUND_STOP)) {
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: sound 0x%p STOP returned %d\n", (void *)this, result);
+		ss[(sizeof ss) - 1] = '\0';
+		put_audio_diag (ss);
+	}
+
+	return result;
+}
+
+// Redirects Play and Stop in a sound object's vtable, unless this vtable has already been done. Sound objects of the same kind share one, so this
+// only does real work the first few times.
+void
+hook_sound_core_vtable (Sound_Core * core)
+{
+	struct audio_diagnostics * ad = &is->audio_diagnostics;
+	char ss[300];
+
+	if ((core == NULL) || (core->vtable == NULL))
+		return;
+
+	for (int n = 0; n < ad->hooked_sound_vtable_count; n++)
+		if (ad->hooked_sound_vtables[n] == core->vtable)
+			return;
+
+	if (ad->hooked_sound_vtable_count >= MAX_HOOKED_SOUND_VTABLES) {
+		put_audio_diag ("C3X audio: out of room to hook sound vtables\n");
+		return;
+	}
+
+	// Record the originals from the first vtable we see. If a later one points Play or Stop somewhere else then calling through our saved copies
+	// would run the wrong code, so leave that vtable alone and say so rather than guess.
+	if (ad->hooked_sound_vtable_count > 0) {
+		if ((core->vtable->Play != ad->sound_core_play) || (core->vtable->Stop != ad->sound_core_stop)) {
+			snprintf (ss, sizeof ss, "C3X audio: sound vtable 0x%p has different Play/Stop, not hooking it\n", (void *)core->vtable);
+			ss[(sizeof ss) - 1] = '\0';
+			put_audio_diag (ss);
+			return;
+		}
+	} else {
+		ad->sound_core_play = core->vtable->Play;
+		ad->sound_core_stop = core->vtable->Stop;
+	}
+
+	// Play and Stop are adjacent, so one call covers both.
+	WITH_MEM_PROTECTION (&core->vtable->Play, 2 * sizeof (void *), PAGE_READWRITE) {
+		core->vtable->Play = patch_sound_core_play;
+		core->vtable->Stop = patch_sound_core_stop;
+	}
+	ad->hooked_sound_vtables[ad->hooked_sound_vtable_count++] = core->vtable;
+
+	snprintf (ss, sizeof ss, "C3X audio: hooked Play/Stop in sound vtable 0x%p\n", (void *)core->vtable);
+	ss[(sizeof ss) - 1] = '\0';
+	put_audio_diag (ss);
+}
+
+int __cdecl
+patch_create_sound (Sound_Core ** out_sound_core, char const * file_path, int sound_core_type)
+{
+	int result = is->audio_diagnostics.orig_create_sound (out_sound_core, file_path, sound_core_type);
+	Sound_Core * core = ((out_sound_core != NULL) && (result == 0)) ? *out_sound_core : NULL;
+
+	if (core != NULL)
+		hook_sound_core_vtable (core);
+
+	if (should_log_audio_diag (ADK_CREATE_SOUND)) {
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: create_sound(\"%s\", type %d) -> sound 0x%p, returned %d\n",
+			  (file_path != NULL) ? file_path : "(none)", sound_core_type, (void *)core, result);
+		ss[(sizeof ss) - 1] = '\0';
+		put_audio_diag (ss);
+	}
+
+	return result;
+}
+
+int __cdecl
+patch_delete_sound (Sound_Core * sound_core)
+{
+	if (should_log_audio_diag (ADK_DELETE_SOUND)) {
+		char ss[300];
+		snprintf (ss, sizeof ss, "C3X audio: delete_sound(sound 0x%p)\n", (void *)sound_core);
+		ss[(sizeof ss) - 1] = '\0';
+		put_audio_diag (ss);
+	}
+
+	return is->audio_diagnostics.orig_delete_sound (sound_core);
+}
+
 // True if the path or module name refers to sound.dll. The game may pass a full path, so match the file name at the end.
 bool
 names_sound_dll (char const * name)
@@ -34634,21 +34748,33 @@ patch_audio_diag_GetProcAddress (HMODULE module, char const * proc_name)
 
 	report_sound_dll_imports (); // no-op unless it hasn't been done yet, which is the case if logging got turned on after sound.dll loaded
 
+	// Exports can be requested by ordinal instead of by name, in which case the "name" is a small integer rather than a pointer. That's how Civ 3
+	// asks for everything, including the wave and midi device constructors whose real names are C++ mangled.
+	bool by_ordinal = ((unsigned)proc_name & 0xFFFF0000) == 0;
+	char const * name = by_ordinal ? find_export_name (module, (unsigned)proc_name) : proc_name;
+
 	if (should_log_audio_diag (ADK_GET_PROC_ADDRESS)) {
 		char ss[300];
-		// Exports can be requested by ordinal instead of by name, in which case the "name" is a small integer rather than a pointer. That's
-		// how Civ 3 asks for the wave and midi device constructors, whose real names are C++ mangled.
-		if (((unsigned)proc_name & 0xFFFF0000) == 0)
-		{
-			unsigned ordinal = (unsigned)proc_name;
-			char const * name = find_export_name (module, ordinal);
+		if (by_ordinal)
 			snprintf (ss, sizeof ss, "C3X audio: game resolved sound.dll ordinal %u (%s) -> 0x%p\n",
-				  ordinal, (name != NULL) ? name : "no name", result);
-		}
+				  (unsigned)proc_name, (name != NULL) ? name : "no name", result);
 		else
 			snprintf (ss, sizeof ss, "C3X audio: game resolved sound.dll \"%s\" -> 0x%p\n", proc_name, result);
 		ss[(sizeof ss) - 1] = '\0';
 		put_audio_diag (ss);
+	}
+
+	// Hand back wrappers for the two entry points that bracket a sound's life. Matching on the exported name rather than the ordinal keeps this
+	// working if a different build of sound.dll numbers its exports differently. Both signatures are the ones the Sound Test harness and the AMB
+	// Editor already call successfully, so there is no guesswork in the call through.
+	if ((name != NULL) && (result != NULL)) {
+		if (strcmp (name, "create_sound") == 0) {
+			is->audio_diagnostics.orig_create_sound = (void *)result;
+			return (FARPROC)patch_create_sound;
+		} else if (strcmp (name, "delete_sound") == 0) {
+			is->audio_diagnostics.orig_delete_sound = (void *)result;
+			return (FARPROC)patch_delete_sound;
+		}
 	}
 
 	return result;
