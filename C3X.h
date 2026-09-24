@@ -729,8 +729,12 @@ struct Sound_Core {
 	// many more fields omitted
 };
 
-// Sound objects of the same kind share a vtable, so there are only ever a handful.
-#define MAX_HOOKED_SOUND_VTABLES 8
+// One vtable per kind of sound. Three have been seen so far; the ceiling is generous because a refused vtable means blind sounds.
+#define MAX_HOOKED_SOUND_VTABLES 16
+
+// Live sound objects to remember filenames for. The game preloads about fifty at startup and makes more as it goes.
+#define MAX_TRACKED_SOUNDS 512
+#define SOUND_PATH_LEN 96
 
 // The audio diagnostics hook one function each. Used to index audio_diagnostics.log_counts so that one chatty function can't flood the log.
 enum audio_diag_kind {
@@ -752,11 +756,15 @@ enum audio_diag_kind {
 // How many times each hooked function will log before going quiet. timeSetEvent in particular may be called over and over for one-shot timers.
 #define MAX_AUDIO_DIAG_LOGS 50
 
+// The sound lifecycle events are the ones the question now turns on, so they get far more room than the one-off startup chatter.
+// At fifty they were exhausted by the preload alone, before a single sound had been played.
+#define MAX_SOUND_EVENT_LOGS 600
+
 // The game sets up its sound timers and loads sound.dll while it's starting, which is long before C3X reads any config file, so at the time those
 // calls happen we don't yet know whether the player asked for diagnostics. Lines produced that early are held in a buffer of this size and then
 // either printed or thrown away once the config has been read. Listing sound.dll's imports is what sets the size.
-#define AUDIO_DIAG_BUFFER_LINES 256
-#define AUDIO_DIAG_LINE_LEN 256
+#define AUDIO_DIAG_BUFFER_LINES 512
+#define AUDIO_DIAG_LINE_LEN 192
 
 enum c3x_label {
 	CL_NEVER_COMPLETES = 0,
@@ -2373,16 +2381,28 @@ struct injected_state {
 		// and Stop the wrapper finds in the first sound object's vtable.
 		int (__cdecl * orig_create_sound) (Sound_Core ** out_sound_core, char const * file_path, int sound_core_type);
 		int (__cdecl * orig_delete_sound) (Sound_Core * sound_core);
-		int (__fastcall * sound_core_play) (Sound_Core * this, int edx);
-		int (__fastcall * sound_core_stop) (Sound_Core * this, int edx);
-		Sound_Core_vtable * hooked_sound_vtables[MAX_HOOKED_SOUND_VTABLES];
+
+		// Each kind of sound has its own vtable with its own Play and Stop, so the originals are kept per vtable. Keeping one shared pair
+		// meant only the first kind could be hooked and every other kind went unwatched, which is most of them.
+		struct hooked_sound_vtable {
+			Sound_Core_vtable * vtable;
+			int (__fastcall * Play) (Sound_Core * this, int edx);
+			int (__fastcall * Stop) (Sound_Core * this, int edx);
+		} hooked_sound_vtables[MAX_HOOKED_SOUND_VTABLES];
 		int hooked_sound_vtable_count;
+
+		// Which file each live sound object was made from, so an event can name the sound instead of only its address. Correlating addresses
+		// by hand across a few hundred creations is not something a log should ask of anyone.
+		struct tracked_sound {
+			Sound_Core * core;
+			char path[SOUND_PATH_LEN];
+		} tracked_sounds[MAX_TRACKED_SOUNDS];
 
 		// sound.dll's own CoCreateInstance, hooked so we can see which COM classes it asks for and whether it gets them.
 		long (WINAPI * orig_co_create_instance) (void *, void *, unsigned, void *, void **);
 
 		HMODULE sound_module; // sound.dll once we've seen the game load it, NULL before then
-		bool reported_sound_imports; // so we only walk and report sound.dll's import table once
+		bool reported_sound_exports; // so we only walk and report sound.dll's export table once
 
 		int log_counts[COUNT_ADK];
 
