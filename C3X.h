@@ -728,8 +728,11 @@ enum audio_diag_kind {
 
 // The game sets up its sound timers and loads sound.dll while it's starting, which is long before C3X reads any config file, so at the time those
 // calls happen we don't yet know whether the player asked for diagnostics. Lines produced that early are held in a buffer of this size and then
-// either printed or thrown away once the config has been read. Startup only produces a couple of dozen lines.
-#define AUDIO_DIAG_BUFFER_LINES 64
+// either printed or thrown away once the config has been read. Listing sound.dll's imports is what sets the size.
+// How many multimedia timer functions hook_winmm_timers redirects per module.
+#define COUNT_WINMM_TIMER_HOOKS 5
+
+#define AUDIO_DIAG_BUFFER_LINES 256
 #define AUDIO_DIAG_LINE_LEN 256
 
 enum c3x_label {
